@@ -78,5 +78,14 @@
  * # Status
  *
  * The library is currently in its early development status.
+ *
+ * Also, the way we'll connect to the other code (like creating the scopes for the machines) is a
+ * bit in flux.
  */
 
+extern crate mio;
+
+pub mod error;
+mod core;
+
+pub use core::Loop;
