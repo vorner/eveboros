@@ -1,57 +1,60 @@
 
 use error::Result;
-use mio::{Poll,Events};
+use mio::{Poll,Events,Token,Ready};
 use std::marker::PhantomData;
-use std::time::Duration;
 
-pub struct Loop {
+pub struct TimeoutId(usize);
+pub struct WakeupId(usize);
+
+pub struct Loop<Context> {
     poll: Poll,
     events: Events,
     active: bool,
+    context: Context
     /*
      * TODO: We need some way to store the events. Even the ones that are not
      * implemented directly by the loop.
      */
 }
 
-pub trait Event<Value> {
-    fn call(&mut self, event_loop: &mut Loop, handle: &Handle<Value>, value: Value);
+pub trait LoopIface<Context> {
 }
 
-#[derive(Clone,Copy,Debug)]
-pub struct Handle<Value> {
-    _data: PhantomData<Value>,
+pub struct Scope<'a, Loop: 'a> {
+    event_loop: &'a mut Loop,
 }
 
-pub trait LoopRegistrar<Event, Handle, Parameter> {
-    fn register(&mut self, event: Event, param: &Parameter) -> Handle;
-    // May fail if the event doesn't exist
-    fn reregister(&mut self, handle: Handle, param: &Parameter) -> Result<()>;
-    // May fail if the event doesn't exist
-    fn deregister(&mut self, handle: Handle) -> Result<Event>;
-    // May fail if the event doesn't exist
-    fn borrow<F, R>(&self, func: F) -> Result<R> where F: FnOnce(&Event) -> R;
-    // May fail if the event doesn't exist
-    fn borrow_mut<F, R>(&mut self, func: F) -> Result<R> where F: FnOnce(&mut Event) -> R;
+pub type Response = Result<bool>;
+
+pub trait Event<Loop> {
+    fn io<'a>(&mut self, scope: &Scope<'a, Loop>, token: &Token, ready: &Ready) -> Response;
+    fn timeout<'a>(&mut self, scope: &Scope<'a, Loop>, id: &TimeoutId) -> Response;
+    fn signal<'a>(&mut self, scope: &Scope<'a, Loop>, signal: i8) -> Response;
+    fn wakeup<'a>(&mut self, scope: &Scope<'a, Loop>, id: &WakeupId) -> Response;
 }
 
-impl Loop {
+pub struct Handle<Context> {
+    _data: PhantomData<Context>,
+}
+
+impl<Context> Loop<Context> {
     /**
      * Create a new Loop.
      *
      * The loop is empty, holds no events, but is otherwise ready.
      */
-    pub fn new() -> Result<Self> {
+    pub fn new(context: Context) -> Result<Self> {
         Ok(Loop {
             poll: Poll::new()?,
             events: Events::with_capacity(1024),
             active: false,
+            context: context,
         })
     }
     pub fn run_one(&mut self) -> Result<()> {
         unimplemented!();
     }
-    pub fn run_until<Value>(&mut self, handle: Handle<Value>) -> Result<()> {
+    pub fn run_until(&mut self, handle: &Handle<Context>) -> Result<()> {
         unimplemented!();
     }
     pub fn run(&mut self) -> Result<()> {
@@ -62,7 +65,3 @@ impl Loop {
         Ok(())
     }
 }
-
-trait TimerEvent: Event<Duration> {}
-impl<E: Event<Duration>> TimerEvent for E {}
-type TimerHandler = Handle<Duration>;
