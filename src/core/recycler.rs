@@ -89,6 +89,11 @@ impl<T> Recycler<T> {
         self.free.push(idx);
     }
 
+    /// Check if the given index is valid (stores some value)
+    pub fn valid(&self, idx: usize) -> bool {
+        idx < self.data.len() && self.data[idx].is_some()
+    }
+
     /**
      * How many items can be held without reallocation. Note that the reallocation happens
      * automatically.
