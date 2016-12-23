@@ -5,10 +5,10 @@ use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready};
 use std::num::Wrapping;
 
-pub struct TimeoutId(usize);
-pub struct WakeupId(usize);
+pub struct TimeoutId(u64);
+pub struct WakeupId(u64);
 
-#[derive(Clone)]
+#[derive(Debug,Clone)]
 pub struct Handle {
     id: usize,
     generation: u64,
@@ -21,6 +21,7 @@ pub trait LoopIface<Context, Ev> {
 pub trait Scope<Context> {
     fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context);
     fn stop(&mut self);
+    fn run_until_complete(&mut self, handle: &Handle) -> Result<()>;
 }
 
 pub type Response = Result<bool>;
@@ -87,7 +88,18 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
         unimplemented!();
     }
     pub fn run_until_complete(&mut self, handle: &Handle) -> Result<()> {
+        let mut checked = false;
         while self.event_alive(handle) {
+            /*
+             * We want to deteckt a deadlock when an event that is curretly running is recursively
+             * waited on. We do that check on the first iteration only, as it can't change later
+             * on. We know the event is alive, so we don't have to check for the validity of
+             * the id or if it got reused.
+             */
+            if !checked && self.events[handle.id].event.is_none() {
+                return Err(Error::DeadLock)
+            }
+            checked = true;
             self.run_one()?
         }
         Ok(())
@@ -155,6 +167,9 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
     }
     fn stop(&mut self) {
         self.event_loop.stop()
+    }
+    fn run_until_complete(&mut self, handle: &Handle) -> Result<()> {
+        self.event_loop.run_until_complete(handle)
     }
 }
 

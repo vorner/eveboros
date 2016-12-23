@@ -1,12 +1,17 @@
 use std::convert::From;
 use std::io;
 
-/// A EveBoros error. Empty for now, but that shall change.
+/// A EveBoros error.
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
+    // The default implementation called
     DefaultImpl,
+    // An event waits recursively for itself
+    DeadLock,
 }
+
+// TODO: Implement the error trait
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
