@@ -1,3 +1,4 @@
+mod recycler;
 
 use error::Result;
 use mio::{Poll,Events,Token,Ready};
