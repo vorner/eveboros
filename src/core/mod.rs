@@ -6,18 +6,19 @@ use std::marker::PhantomData;
 pub struct TimeoutId(usize);
 pub struct WakeupId(usize);
 
-pub struct Loop<Context> {
+pub struct Loop<Context, Ev> {
     poll: Poll,
     events: Events,
     active: bool,
-    context: Context
+    context: Context,
+    _phantom: PhantomData<Ev>,  // So it compiles
     /*
      * TODO: We need some way to store the events. Even the ones that are not
      * implemented directly by the loop.
      */
 }
 
-pub trait LoopIface<Context> {
+pub trait LoopIface<Context, Ev> {
 }
 
 pub struct Scope<'a, Loop: 'a> {
@@ -33,11 +34,12 @@ pub trait Event<Loop> {
     fn wakeup<'a>(&mut self, scope: &Scope<'a, Loop>, id: &WakeupId) -> Response;
 }
 
-pub struct Handle<Context> {
+pub struct Handle<Context, Ev> {
     _data: PhantomData<Context>,
+    _event: PhantomData<Ev>,
 }
 
-impl<Context> Loop<Context> {
+impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
     /**
      * Create a new Loop.
      *
@@ -49,12 +51,13 @@ impl<Context> Loop<Context> {
             events: Events::with_capacity(1024),
             active: false,
             context: context,
+            _phantom: PhantomData,
         })
     }
     pub fn run_one(&mut self) -> Result<()> {
         unimplemented!();
     }
-    pub fn run_until(&mut self, handle: &Handle<Context>) -> Result<()> {
+    pub fn run_until(&mut self, handle: &Handle<Context, Ev>) -> Result<()> {
         unimplemented!();
     }
     pub fn run(&mut self) -> Result<()> {
