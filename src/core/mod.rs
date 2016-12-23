@@ -4,6 +4,8 @@ use self::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready};
 use std::num::Wrapping;
+use std::any::Any;
+use std::collections::VecDeque;
 
 pub struct TimeoutId(u64);
 pub struct WakeupId(u64);
@@ -33,13 +35,25 @@ pub trait Event<Context> {
     fn signal<S: Scope<Context>>(&mut self, scope: &mut S, signal: i8) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context>>(&mut self, scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     // Any better interface? A way to directly send data to it? A separate trait?
-    fn wakeup<S: Scope<Context>>(&mut self, scope: &mut S, id: &WakeupId) -> Response { Err(Error::DefaultImpl) }
+    fn wakeup<S: Scope<Context>>(&mut self, scope: &mut S, data: Option<Box<Any>>) -> Response { Err(Error::DefaultImpl) }
 }
 
 struct EvHolder<Event> {
     event: Option<Event>,
     generation: u64,
     // Some other accounting data
+}
+
+enum EventParam {
+    Io(Token, Ready),
+    Timeout(TimeoutId),
+    Signal(i8),
+    Wakeup(Option<Box<Any>>),
+}
+
+struct BasicEvent {
+    recipipent: Handle,
+    param: EventParam,
 }
 
 pub struct Loop<Context, Ev> {
@@ -54,6 +68,8 @@ pub struct Loop<Context, Ev> {
      * hit the very same index and go through all 2^64 iterations to cause hitting a collision.
      */
     generation: Wrapping<u64>,
+    // Preparsed events we received from mio and other sources, ready to be dispatched one by one
+    scheduled: VecDeque<BasicEvent>,
 }
 
 impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
@@ -70,6 +86,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             context: context,
             events: Recycler::new(),
             generation: Wrapping(0),
+            scheduled: VecDeque::new(),
         })
     }
     /// Kill an event at given index.
