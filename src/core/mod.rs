@@ -20,6 +20,7 @@ pub trait LoopIface<Context, Ev> {
 
 pub trait Scope<Context> {
     fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context);
+    fn stop(&mut self);
 }
 
 pub type Response = Result<bool>;
@@ -29,6 +30,7 @@ pub trait Event<Context> {
     fn io<S: Scope<Context>>(&mut self, scope: &mut S, token: &Token, ready: &Ready) -> Response { Err(Error::DefaultImpl) }
     fn timeout<S: Scope<Context>>(&mut self, scope: &mut S, id: &TimeoutId) -> Response { Err(Error::DefaultImpl) }
     fn signal<S: Scope<Context>>(&mut self, scope: &mut S, signal: i8) -> Response { Err(Error::DefaultImpl) }
+    fn idle<S: Scope<Context>>(&mut self, scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     // Any better interface? A way to directly send data to it? A separate trait?
     fn wakeup<S: Scope<Context>>(&mut self, scope: &mut S, id: &WakeupId) -> Response { Err(Error::DefaultImpl) }
 }
@@ -69,19 +71,6 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             generation: Wrapping(0),
         })
     }
-    pub fn run_one(&mut self) -> Result<()> {
-        unimplemented!();
-    }
-    pub fn run_until(&mut self, handle: &Handle) -> Result<()> {
-        unimplemented!();
-    }
-    pub fn run(&mut self) -> Result<()> {
-        self.active = true;
-        while self.active {
-            self.run_one()?
-        }
-        Ok(())
-    }
     /// Kill an event at given index.
     fn event_kill(&mut self, idx: usize) {
         // TODO: Some other handling, like killing its IOs, timers, etc
@@ -90,6 +79,28 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
     /// Access the stored context
     pub fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context) {
         f(&mut self.context)
+    }
+    pub fn event_alive(&self, handle: &Handle) -> bool {
+        self.events.valid(handle.id) && self.events[handle.id].generation == handle.generation
+    }
+    pub fn run_one(&mut self) -> Result<()> {
+        unimplemented!();
+    }
+    pub fn run_until_complete(&mut self, handle: &Handle) -> Result<()> {
+        while self.event_alive(handle) {
+            self.run_one()?
+        }
+        Ok(())
+    }
+    pub fn run(&mut self) -> Result<()> {
+        self.active = true;
+        while self.active {
+            self.run_one()?
+        }
+        Ok(())
+    }
+    pub fn stop(&mut self) {
+        self.active = false;
     }
 }
 
@@ -142,6 +153,9 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
     fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context) {
         self.event_loop.with_context(f)
     }
+    fn stop(&mut self) {
+        self.event_loop.stop()
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +188,7 @@ mod tests {
     fn init_and_context() {
         let destroyed = Rc::new(Cell::new(false));
         let mut l = Loop::new(false).unwrap();
-        l.insert(InitAndContextEvent(destroyed.clone()));
+        let handle = l.insert(InitAndContextEvent(destroyed.clone())).unwrap();
         // Init got called (the context gets set to true there
         l.with_context(|c| assert!(*c));
         /*
@@ -182,5 +196,9 @@ mod tests {
          * by now (even before the loop itself)
          */
         assert!(destroyed.get());
+        // And it is not alive (obviously)
+        assert!(!l.event_alive(&handle));
+        // As it is not alive, run_until_complete finishes right away
+        l.run_until_complete(&handle);
     }
 }
