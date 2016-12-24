@@ -98,6 +98,7 @@ impl<T> Recycler<T> {
      * How many items can be held without reallocation. Note that the reallocation happens
      * automatically.
      */
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }

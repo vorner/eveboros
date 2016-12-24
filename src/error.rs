@@ -4,11 +4,23 @@ use std::io;
 /// A EveBoros error.
 #[derive(Debug)]
 pub enum Error {
+    /// An embedded IO error from some low-level operation
     Io(io::Error),
-    // The default implementation called
+    /**
+     * The default implementation called
+     *
+     * You likely registered for something but haven't implemented the receiver.
+     */
     DefaultImpl,
-    // An event waits recursively for itself
+    /// An event waits recursively for itself
     DeadLock,
+    /// The referred event is not there
+    Missing,
+    /**
+     * The referred event is currently in the middle of a callback and
+     * can't be bothered right now (you know, recursion).
+     */
+    Busy
 }
 
 // TODO: Implement the error trait
