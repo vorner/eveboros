@@ -2,13 +2,18 @@ mod recycler;
 
 // TODO: Some logging
 
+// TODO: How do we propagate errors? Kill the loop? Error handler?
+
 use self::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready};
 use std::num::Wrapping;
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{VecDeque,BinaryHeap};
 use std::marker::Sized;
+use std::time::{Instant,Duration};
+use std::cmp::Ordering;
+use std::mem::replace;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct TimeoutId(u64);
@@ -27,10 +32,17 @@ pub trait LoopIface<Context> {
     fn stop(&mut self);
     fn event_alive(&self, handle: &Handle) -> bool;
     fn event_count(&self) -> usize;
+    // This one may be cached and little bit behind in case of long CPU computations
+    fn now(&self) -> &Instant;
 }
 
 pub trait Scope<Context>: LoopIface<Context> {
     fn handle(&self) -> &Handle;
+    fn timeout_at(&mut self, when: Instant) -> TimeoutId;
+    fn timeout_after(&mut self, after: &Duration) -> TimeoutId {
+        let at = *self.now() + *after;
+        self.timeout_at(at)
+    }
 }
 
 pub trait EvAccess<Context, Ev: Event<Context>> {
@@ -57,11 +69,13 @@ pub trait Postable<Context, Data>: Event<Context> {
 struct EvHolder<Event> {
     event: Option<Event>,
     generation: u64,
+    // How many timeouts does it have?
+    timeouts: usize,
     // Some other accounting data
 }
 
 #[derive(Debug)]
-enum EventParam {
+enum TaskParam {
     Io(Token, Ready),
     Timeout(TimeoutId),
     Signal(i8),
@@ -69,9 +83,27 @@ enum EventParam {
 }
 
 #[derive(Debug)]
-struct BasicEvent {
-    recipipent: Handle,
-    param: EventParam,
+struct Task {
+    recipient: Handle,
+    param: TaskParam,
+}
+
+#[derive(Debug,Eq,PartialEq)]
+struct TimeoutHolder {
+    id: TimeoutId,
+    recipient: Handle,
+    when: Instant,
+}
+
+impl Ord for TimeoutHolder {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Flip around (we want the smaller ones first)
+        other.when.cmp(&self.when)
+    }
+}
+
+impl PartialOrd for TimeoutHolder {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
 pub struct Loop<Context, Ev> {
@@ -87,7 +119,24 @@ pub struct Loop<Context, Ev> {
      */
     generation: Wrapping<u64>,
     // Preparsed events we received from mio and other sources, ready to be dispatched one by one
-    scheduled: VecDeque<BasicEvent>,
+    scheduled: VecDeque<Task>,
+    /*
+     * The timeouts we want to fire some time. We don't prune the ones from events that died,
+     * but we ignore them when they die.
+     *
+     * We don't remove timeouts of killed events right away, we ignore them when they fire.
+     * However, when there's more dead ones than live ones, we go through it whole and prune them.
+     */
+    timeouts: BinaryHeap<TimeoutHolder>,
+    // How many were dropped because of dying event?
+    timeouts_dead: usize,
+    // How many did fire?
+    timeouts_fired: usize,
+    // How many were created?
+    timeouts_inserted: usize,
+    timeout_generation: Wrapping<u64>,
+    // Cached from the last tick of the loop
+    now: Instant,
 }
 
 impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
@@ -105,12 +154,20 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             events: Recycler::new(),
             generation: Wrapping(0),
             scheduled: VecDeque::new(),
+            timeouts: BinaryHeap::new(),
+            timeouts_dead: 0,
+            timeouts_fired: 0,
+            timeouts_inserted: 0,
+            timeout_generation: Wrapping(0),
+            now: Instant::now(),
         })
     }
     /// Kill an event at given index.
     fn event_kill(&mut self, idx: usize) {
         // TODO: Some other handling, like killing its IOs, timers, etc
-        self.events.release(idx);
+        let event = self.events.release(idx);
+        // These timeouts are dead now
+        self.timeouts_dead += event.timeouts;
     }
     // Run function on an event, with the scope and result checking
     fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: &Handle, f: F) -> Result<()> {
@@ -148,6 +205,98 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             Err(Error::Busy)
         }
     }
+    fn timeout_at(&mut self, handle: &Handle, when: Instant) -> TimeoutId {
+        // Generate an ID for the timeout
+        let Wrapping(id) = self.timeout_generation;
+        let id = TimeoutId(id);
+        self.timeout_generation += Wrapping(1);
+        // This gets called only through the event's context, so it's safe
+        self.events[handle.id].timeouts += 1;
+        self.timeouts_inserted += 1;
+
+        self.timeouts.push(TimeoutHolder {
+            id: id.clone(),
+            recipient: handle.clone(),
+            when: when
+        });
+
+        id
+    }
+    /**
+     * Compute when to wake up latest (we can wake up sooner). This takes the scheduled timeouts
+     * into consideration, but also things like existence of Idle tasks.
+     */
+    fn timeout_min(&mut self) -> Option<Duration> {
+        /*
+         * First, get rid of all timeouts to dead events (since we don't want to wake up because of
+         * them).
+         */
+        while self.timeouts.peek().map_or(false, |t| !self.event_alive(&t.recipient)) {
+            self.timeouts.pop();
+        }
+        // The computations may have taken some time, so get a fresh now.
+        let now = Instant::now();
+        self.timeouts.peek().map(|t| {
+            if t.when < now {
+                Duration::new(0, 0)
+            } else {
+                t.when.duration_since(now)
+            }
+        })
+    }
+    /**
+     * Gather some tasks. They get added in priority (eg. if there are some IO tasks, no timeouts
+     * are added to the queue):
+     *
+     * * IO tasks, signals, Wakeups
+     * * Timeouts
+     * * Idle tasks
+     *
+     * It is possible this produces no tasks.
+     */
+    fn tasks_gather(&mut self) -> Result<()> {
+        assert!(self.scheduled.is_empty());
+        let wakeup = self.timeout_min();
+        self.poll.poll(&mut self.mio_events, wakeup)?;
+        // We slept a while, update the now cache
+        self.now = Instant::now();
+
+        if self.mio_events.is_empty() {
+            /*
+             * If there are too many dead timeouts, clean them up.
+             * Have some limit for low amount of events, where we don't bother.
+             */
+            let handled = self.timeouts_inserted - self.timeouts.len();
+            let handled_dead = handled - self.timeouts_fired;
+            let still_dead = self.timeouts_dead - handled_dead;
+            let still_alive = self.timeouts.len() - still_dead;
+            // Reset the stats
+            self.timeouts_dead = still_dead;
+            self.timeouts_fired = 0;
+            self.timeouts_inserted = self.timeouts.len();
+            // Check for too many dead ones in the storage
+            if still_dead > 5 && still_alive * 3 < still_dead {
+                let mut old = replace(&mut self.timeouts, BinaryHeap::new());
+                let pruned: BinaryHeap<TimeoutHolder> = old.drain().filter(|ref t| self.event_alive(&t.recipient)).collect();
+                self.timeouts = pruned;
+                self.timeouts_dead = 0;
+                self.timeouts_inserted = self.timeouts.len();
+            }
+
+            while self.timeouts.peek().map_or(false, |t| t.when <= self.now) {
+                // This must be Some(...), because of the condition above
+                let timeout = self.timeouts.pop().unwrap();
+                self.scheduled.push_back(Task {
+                    recipient: timeout.recipient,
+                    param: TaskParam::Timeout(timeout.id),
+                })
+            }
+            Ok(())
+            // TODO: If none added, look for idle tasks
+        } else {
+            unimplemented!();
+        }
+    }
 }
 
 impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
@@ -156,7 +305,26 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
         f(&mut self.context)
     }
     fn run_one(&mut self) -> Result<()> {
-        unimplemented!();
+        // We loop until we find a task that is for a living event
+        loop {
+            while self.scheduled.is_empty() {
+                // Make sure we have something to do
+                self.tasks_gather()?
+            }
+            let task = self.scheduled.pop_front().unwrap();
+            if self.event_alive(&task.recipient) {
+                return match task.param {
+                    TaskParam::Io(_token, _ready) => unimplemented!(),
+                    TaskParam::Timeout(id) => {
+                        self.timeouts_fired += 1;
+                        self.events[task.recipient.id].timeouts -= 1;
+                        self.event_call(&task.recipient, |event, context| event.timeout(context, &id))
+                    },
+                    TaskParam::Signal(_signal) => unimplemented!(),
+                    TaskParam::Wakeup(_data) => unimplemented!(),
+                }
+            }
+        }
     }
     fn run_until_complete(&mut self, handle: &Handle) -> Result<()> {
         let mut checked = false;
@@ -188,9 +356,8 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
     fn event_alive(&self, handle: &Handle) -> bool {
         self.events.valid(handle.id) && self.events[handle.id].generation == handle.generation
     }
-    fn event_count(&self) -> usize {
-        self.events.len()
-    }
+    fn event_count(&self) -> usize { self.events.len() }
+    fn now(&self) -> &Instant { &self.now }
 }
 
 impl<Context, Ev: Event<Context>> EvAccess<Context, Ev> for Loop<Context, Ev> {
@@ -201,7 +368,8 @@ impl<Context, Ev: Event<Context>> EvAccess<Context, Ev> for Loop<Context, Ev> {
         // Store the event in the storage
         let idx = self.events.store(EvHolder {
             event: Some(event),
-            generation: generation
+            generation: generation,
+            timeouts: 0,
         });
         // Generate a handle for it
         let handle = Handle {
@@ -230,10 +398,12 @@ impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<
     fn run(&mut self) -> Result<()> { self.event_loop.run() }
     fn event_alive(&self, handle: &Handle) -> bool { self.event_loop.event_alive(handle) }
     fn event_count(&self) -> usize { self.event_loop.event_count() }
+    fn now(&self) -> &Instant { self.event_loop.now() }
 }
 
 impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> &Handle { &self.handle }
+    fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(&self.handle, when) }
 }
 
 impl<'a, Context, Ev: Event<Context>> EvAccess<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -247,6 +417,7 @@ mod tests {
     use ::error::*;
     use std::rc::Rc;
     use std::cell::Cell;
+    use std::time::Duration;
 
     struct InitAndContextEvent(Rc<Cell<bool>>);
 
@@ -304,11 +475,8 @@ mod tests {
         }
     }
 
-    fn err<T>(result: Result<T>, error: Error) {
-        assert!(match result {
-            Err(error) => true,
-            _ => false
-        })
+    macro_rules! err {
+        ($result:expr, $err: pat) => (assert!(match $result { Err($err) => true, _ => false }))
     }
 
     /**
@@ -325,7 +493,7 @@ mod tests {
         // But it received it and went away
         assert!(!l.event_alive(&handle));
         // And if we try to send again, it fails with Missing
-        err(l.post(&handle, ()), Error::Missing);
+        err!(l.post(&handle, ()), Error::Missing);
     }
 
     struct Recurse;
@@ -348,11 +516,72 @@ mod tests {
         let handle = l.insert(Recipient).unwrap();
         assert!(l.event_alive(&handle));
         // Post a Recurse to it, which would create an infinite recursion of posting to self
-        err(l.post(&handle, Recurse), Error::Busy);
+        err!(l.post(&handle, Recurse), Error::Busy);
         /*
          * As it returned error, it got killed (it returned error because it called itself, not
          * because it was called while busy).
          */
         assert!(!l.event_alive(&handle));
+    }
+
+    // An event that terminates after given amount of milliseconds
+    struct Timeouter {
+        milliseconds: u32,
+        id: Option<TimeoutId>,
+    }
+
+    impl Event<()> for Timeouter {
+        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+            self.id = Some(scope.timeout_after(&Duration::new(0, self.milliseconds)));
+            /*
+             * Add another timeout that won't have the opportunity to fire, check it doesn't cause
+             * problems
+             */
+            scope.timeout_after(&Duration::new(0, self.milliseconds + 1));
+            Ok(true)
+        }
+        // Terminate on the first timeout we get
+        fn timeout<S>(&mut self, _scope: &mut S, id: &TimeoutId) -> Response {
+            assert_eq!(Some(id.clone()), self.id);
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn timeout() {
+        let mut l = Loop::new(()).unwrap();
+        let handle = l.insert(Timeouter {
+            milliseconds: 0,
+            id: None,
+        }).unwrap();
+        // It is alive, because it needs the loop to turn to get the timeout
+        assert!(l.event_alive(&handle));
+        // We can wait for it to happen. Only one timeout gets called (checked in the event)
+        l.run_until_complete(&handle).unwrap();
+        // Add another one that needs to wait a while and check it actually waited
+        assert!(!l.event_alive(&handle));
+        // Add another event
+        let handle_wait = l.insert(Timeouter {
+            milliseconds: 500,
+            id: None,
+        }).unwrap();
+        // The old one didn't get resurrected
+        assert!(!l.event_alive(&handle));
+        // The new one lives
+        assert!(l.event_alive(&handle_wait));
+        let wait_start = l.now().clone();
+        // It should just fire the one event here
+        l.run_one().unwrap();
+        assert!(!l.event_alive(&handle_wait));
+        assert!(l.now().duration_since(wait_start) >= Duration::new(0, 500));
+        // Check dead-timeouts stats. They got adjusted before the run of the second event.
+        assert_eq!(2, l.timeouts_inserted);
+        assert_eq!(1, l.timeouts_fired);
+        assert_eq!(1, l.timeouts_dead);
+        /*
+         * One dead is still left (the other one would have fired by now, so it's dropped).
+         * The one left may be either in the scheduled list or in timouts heap.
+         */
+        assert_eq!(1, l.timeouts.len() + l.scheduled.len());
     }
 }

@@ -81,12 +81,14 @@ impl<T> Recycler<T> {
     /**
      * Return the item at the given index. The index is not valid until the storage retuns it for
      * another newly stored item.
+     *
+     * The old content is returned.
      */
-    pub fn release(&mut self, idx: usize) {
+    pub fn release(&mut self, idx: usize) -> T {
         let ptr = &mut self.data[idx];
         assert!(ptr.is_some());
-        *ptr = None;
         self.free.push(idx);
+        ptr.take().unwrap()
     }
 
     /// Check if the given index is valid (stores some value)
@@ -163,7 +165,7 @@ mod tests {
 
         // Return one of them
         assert_eq!(2, r.store(4));
-        r.release(1);
+        assert_eq!(2, r.release(1));
         assert_eq!(2, r.len());
         assert_eq!(cap, r.capacity()); // The capacity doesn't change by releasing stuff
 
