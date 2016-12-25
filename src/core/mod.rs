@@ -31,7 +31,7 @@ pub struct Handle {
     generation: u64,
 }
 
-pub trait LoopIface<Context, Ev: ?Sized> {
+pub trait LoopIface<Context, Ev> {
     fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny>;
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
     fn run_one(&mut self) -> Result<()>;
@@ -44,7 +44,7 @@ pub trait LoopIface<Context, Ev: ?Sized> {
     fn now(&self) -> &Instant;
 }
 
-pub trait Scope<Context, Ev: ?Sized>: LoopIface<Context, Ev> {
+pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     fn handle(&self) -> Handle;
     fn timeout_at(&mut self, when: Instant) -> TimeoutId;
     fn timeout_after(&mut self, after: &Duration) -> TimeoutId {
@@ -60,12 +60,12 @@ pub trait Scope<Context, Ev: ?Sized>: LoopIface<Context, Ev> {
 
 pub type Response = Result<bool>;
 
-pub trait Event<Context> {
-    fn init<S: Scope<Context, Self>>(&mut self, scope: &mut S) -> Response;
-    fn io<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
-    fn timeout<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
-    fn signal<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
-    fn idle<S: Scope<Context, Self>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
+pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
+    fn init<S: Scope<Context, ScopeEvent>>(&mut self, scope: &mut S) -> Response;
+    fn io<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
+    fn timeout<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
+    fn signal<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
+    fn idle<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     // XXX Any better interface? A way to directly send data to it? A separate trait?
     //fn wakeup<S: Scope<Context, Self> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _data: Option<Box<Any>>) -> Response { Err(Error::DefaultImpl) }
 }
@@ -171,7 +171,7 @@ pub struct Loop<Context, Ev> {
     want_idle: LinkedHashMap<Handle, ()>,
 }
 
-impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
+impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     /**
      * Create a new Loop.
      *
@@ -398,7 +398,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
     }
 }
 
-impl<Context, Ev: Event<Context>> LoopIface<Context, Ev> for Loop<Context, Ev> {
+impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {
     fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> {
         // Assign a new generation
         let Wrapping(generation) = self.generation;
@@ -495,7 +495,7 @@ pub struct LoopScope<'a, Loop: 'a> {
     handle: Handle,
 }
 
-impl<'a, Context, Ev: Event<Context>> LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context, Ev>> LoopScope<'a, Loop<Context, Ev>> {
     fn io_idx(&mut self, id: IoId) -> Result<usize> {
         let Token(mut idx) = id.token;
         idx -= TOKEN_SHIFT;
@@ -506,7 +506,7 @@ impl<'a, Context, Ev: Event<Context>> LoopScope<'a, Loop<Context, Ev>> {
     }
 }
 
-impl<'a, Context, Ev: Event<Context>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> { self.event_loop.insert(event) }
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> { self.event_loop.with_context(f) }
     fn stop(&mut self) { self.event_loop.stop() }
@@ -518,7 +518,7 @@ impl<'a, Context, Ev: Event<Context>> LoopIface<Context, Ev> for LoopScope<'a, L
     fn now(&self) -> &Instant { self.event_loop.now() }
 }
 
-impl<'a, Context, Ev: Event<Context>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> Handle { self.handle }
     fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(self.handle, when) }
     fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
@@ -580,7 +580,7 @@ mod tests {
 
     struct InitAndContextEvent(Rc<Cell<bool>>);
 
-    impl Event<bool> for InitAndContextEvent {
+    impl Event<bool, InitAndContextEvent> for InitAndContextEvent {
         fn init<S: Scope<bool, InitAndContextEvent>>(&mut self, scope: &mut S) -> Response {
             scope.with_context(|c| {
                 *c = true;
@@ -698,7 +698,7 @@ mod tests {
         id: Option<TimeoutId>,
     }
 
-    impl Event<()> for Timeouter {
+    impl Event<(), Timeouter> for Timeouter {
         fn init<S: Scope<(), Timeouter>>(&mut self, scope: &mut S) -> Response {
             self.id = Some(scope.timeout_after(&Duration::new(0, self.milliseconds)));
             /*
@@ -755,7 +755,7 @@ mod tests {
 
     struct ErrorTimeout;
 
-    impl Event<()> for ErrorTimeout {
+    impl Event<(), ErrorTimeout> for ErrorTimeout {
         fn init<S: Scope<(), ErrorTimeout>>(&mut self, scope: &mut S) -> Response {
             scope.timeout_after(&Duration::new(0, 0));
             Ok(true)
@@ -789,7 +789,7 @@ mod tests {
 
     struct Listener;
 
-    impl Event<Option<SocketAddr>> for Listener {
+    impl Event<Option<SocketAddr>, Listener> for Listener {
         fn init<S: Scope<Option<SocketAddr>, Listener>>(&mut self, scope: &mut S) -> Response {
             // The port 0 = OS, please choose for me.
             let listener = TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))?;
@@ -833,7 +833,7 @@ mod tests {
 
     struct Idle;
 
-    impl Event<()> for Idle {
+    impl Event<(), Idle> for Idle {
         fn init<S: Scope<(), Idle>>(&mut self, scope: &mut S) -> Response {
             scope.timeout_after(&Duration::new(10, 0));
             scope.idle();
