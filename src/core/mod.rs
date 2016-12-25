@@ -209,6 +209,14 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
         let event = self.events.release(idx);
         // These timeouts are dead now
         self.timeouts_dead += event.timeouts;
+        // Deregister the IOs
+        for io in event.ios {
+            let Token(mut idx) = io.token;
+            idx -= TOKEN_SHIFT;
+            self.ios_released.insert(idx);
+            // Make sure the Evented inside is destroyed. That'll deregister it from the Poll.
+            self.ios[idx].take();
+        }
         event.event
     }
     // Run function on an event, with the scope and result checking
