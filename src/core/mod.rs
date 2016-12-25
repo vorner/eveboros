@@ -15,6 +15,7 @@ use std::marker::Sized;
 use std::time::{Instant,Duration};
 use std::cmp::Ordering;
 use std::mem::replace;
+use std::convert::From;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct IoId {
@@ -32,7 +33,8 @@ pub struct Handle {
     generation: u64,
 }
 
-pub trait LoopIface<Context> {
+pub trait LoopIface<Context, Ev> {
+    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny>;
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
     fn run_one(&mut self) -> Result<()>;
     fn run_until_complete(&mut self, handle: Handle) -> Result<()>;
@@ -44,7 +46,7 @@ pub trait LoopIface<Context> {
     fn now(&self) -> &Instant;
 }
 
-pub trait Scope<Context>: LoopIface<Context> {
+pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     fn handle(&self) -> Handle;
     fn timeout_at(&mut self, when: Instant) -> TimeoutId;
     fn timeout_after(&mut self, after: &Duration) -> TimeoutId {
@@ -58,25 +60,16 @@ pub trait Scope<Context>: LoopIface<Context> {
     fn idle(&mut self);
 }
 
-pub trait EvAccess<Context, Ev: Event<Context>> {
-    fn insert(&mut self, event: Ev) -> Result<Handle>;
-    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data>;
-}
-
 pub type Response = Result<bool>;
 
 pub trait Event<Context> where Self: Sized {
-    fn init<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, scope: &mut S) -> Response;
-    fn io<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
-    fn timeout<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
-    fn signal<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
-    fn idle<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
-    // Any better interface? A way to directly send data to it? A separate trait?
-    fn wakeup<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _data: Option<Box<Any>>) -> Response { Err(Error::DefaultImpl) }
-}
-
-pub trait Postable<Context, Data>: Event<Context> {
-    fn deliver<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _data: Data) -> Response;
+    fn init<S: Scope<Context, Self>>(&mut self, scope: &mut S) -> Response;
+    fn io<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
+    fn timeout<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
+    fn signal<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
+    fn idle<S: Scope<Context, Self>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
+    // XXX Any better interface? A way to directly send data to it? A separate trait?
+    //fn wakeup<S: Scope<Context, Self> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _data: Option<Box<Any>>) -> Response { Err(Error::DefaultImpl) }
 }
 
 struct EvHolder<Event> {
@@ -407,7 +400,27 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
     }
 }
 
-impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
+impl<Context, Ev: Event<Context>> LoopIface<Context, Ev> for Loop<Context, Ev> {
+    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> {
+        // Assign a new generation
+        let Wrapping(generation) = self.generation;
+        self.generation += Wrapping(1);
+        // Store the event in the storage
+        let idx = self.events.store(EvHolder {
+            event: Some(event.into()),
+            generation: generation,
+            timeouts: 0,
+            ios: HashSet::new(),
+        });
+        // Generate a handle for it
+        let handle = Handle {
+            id: idx,
+            generation: generation
+        };
+        // Run the init for the event
+        self.event_call(handle, |event, context| event.init(context))?;
+        Ok(handle)
+    }
     /// Access the stored context
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> {
         f(&mut self.context)
@@ -479,32 +492,6 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
     fn now(&self) -> &Instant { &self.now }
 }
 
-impl<Context, Ev: Event<Context>> EvAccess<Context, Ev> for Loop<Context, Ev> {
-    fn insert(&mut self, event: Ev) -> Result<Handle> {
-        // Assign a new generation
-        let Wrapping(generation) = self.generation;
-        self.generation += Wrapping(1);
-        // Store the event in the storage
-        let idx = self.events.store(EvHolder {
-            event: Some(event),
-            generation: generation,
-            timeouts: 0,
-            ios: HashSet::new(),
-        });
-        // Generate a handle for it
-        let handle = Handle {
-            id: idx,
-            generation: generation
-        };
-        // Run the init for the event
-        self.event_call(handle, |event, context| event.init(context))?;
-        Ok(handle)
-    }
-    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> {
-        self.event_call(handle, |event, scope| event.deliver(scope, data))
-    }
-}
-
 pub struct LoopScope<'a, Loop: 'a> {
     event_loop: &'a mut Loop,
     handle: Handle,
@@ -521,7 +508,8 @@ impl<'a, Context, Ev: Event<Context>> LoopScope<'a, Loop<Context, Ev>> {
     }
 }
 
-impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
+    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> { self.event_loop.insert(event) }
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> { self.event_loop.with_context(f) }
     fn stop(&mut self) { self.event_loop.stop() }
     fn run_one(&mut self) -> Result<()> { self.event_loop.run_one() }
@@ -532,7 +520,7 @@ impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<
     fn now(&self) -> &Instant { self.event_loop.now() }
 }
 
-impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> Handle { self.handle }
     fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(self.handle, when) }
     fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
@@ -580,11 +568,6 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
     }
 }
 
-impl<'a, Context, Ev: Event<Context>> EvAccess<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
-    fn insert(&mut self, event: Ev) -> Result<Handle> { self.event_loop.insert(event) }
-    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> { self.event_loop.post(handle, data) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,7 +583,7 @@ mod tests {
     struct InitAndContextEvent(Rc<Cell<bool>>);
 
     impl Event<bool> for InitAndContextEvent {
-        fn init<S: Scope<bool>>(&mut self, scope: &mut S) -> Response {
+        fn init<S: Scope<bool, InitAndContextEvent>>(&mut self, scope: &mut S) -> Response {
             scope.with_context(|c| {
                 *c = true;
                 Ok(())
@@ -622,7 +605,7 @@ mod tests {
     #[test]
     fn init_and_context() {
         let destroyed = Rc::new(Cell::new(false));
-        let mut l = Loop::new(false).unwrap();
+        let mut l: Loop<bool, InitAndContextEvent> = Loop::new(false).unwrap();
         let handle = l.insert(InitAndContextEvent(destroyed.clone())).unwrap();
         // Init got called (the context gets set to true there
         l.with_context(|c| {
@@ -641,6 +624,7 @@ mod tests {
         assert_eq!(0, l.event_count());
     }
 
+    /* XXX
     struct Recipient;
 
     impl<C> Event<C> for Recipient {
@@ -657,18 +641,20 @@ mod tests {
             Ok(false)
         }
     }
+    */
 
     macro_rules! err {
         ($result:expr, $err: pat) => (assert!(match $result { Err($err) => true, _ => false }))
     }
 
+    /*
     /**
      * Test we can post to an event.
      */
     #[test]
     fn post() {
         // Create an event that stays there, at least for a while
-        let mut l = Loop::new(()).unwrap();
+        let mut l: Loop<(), Recipient> = Loop::new(()).unwrap();
         let handle = l.insert(Recipient).unwrap();
         assert!(l.event_alive(handle));
         // Post something to it (successfully)
@@ -682,7 +668,7 @@ mod tests {
     struct Recurse;
     // Recurse to self
     impl<C> Postable<C, Recurse> for Recipient {
-        fn deliver<S: Scope<C> + EvAccess<C, Self>>(&mut self, scope: &mut S, data: Recurse) -> Response {
+        fn deliver<S: Scope<C, Recipient> + EvAccess<C, Self>>(&mut self, scope: &mut S, data: Recurse) -> Response {
             let handle = scope.handle();
             scope.post(handle, data)?;
             Ok(true)
@@ -695,7 +681,7 @@ mod tests {
     #[test]
     fn busy_post() {
         // Create an event that stays there
-        let mut l = Loop::new(()).unwrap();
+        let mut l: Loop<(), Recipient> = Loop::new(()).unwrap();
         let handle = l.insert(Recipient).unwrap();
         assert!(l.event_alive(handle));
         // Post a Recurse to it, which would create an infinite recursion of posting to self
@@ -706,6 +692,7 @@ mod tests {
          */
         assert!(!l.event_alive(handle));
     }
+    */
 
     // An event that terminates after given amount of milliseconds
     struct Timeouter {
@@ -714,7 +701,7 @@ mod tests {
     }
 
     impl Event<()> for Timeouter {
-        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+        fn init<S: Scope<(), Timeouter>>(&mut self, scope: &mut S) -> Response {
             self.id = Some(scope.timeout_after(&Duration::new(0, self.milliseconds)));
             /*
              * Add another timeout that won't have the opportunity to fire, check it doesn't cause
@@ -732,7 +719,7 @@ mod tests {
 
     #[test]
     fn timeout() {
-        let mut l = Loop::new(()).unwrap();
+        let mut l: Loop<(), Timeouter> = Loop::new(()).unwrap();
         let handle = l.insert(Timeouter {
             milliseconds: 0,
             id: None,
@@ -771,7 +758,7 @@ mod tests {
     struct ErrorTimeout;
 
     impl Event<()> for ErrorTimeout {
-        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+        fn init<S: Scope<(), ErrorTimeout>>(&mut self, scope: &mut S) -> Response {
             scope.timeout_after(&Duration::new(0, 0));
             Ok(true)
         }
@@ -780,7 +767,7 @@ mod tests {
 
     #[test]
     fn error_handler() {
-        let mut l = Loop::new(()).unwrap();
+        let mut l: Loop<(), ErrorTimeout> = Loop::new(()).unwrap();
         let handle = l.insert(ErrorTimeout).unwrap();
         assert!(l.event_alive(handle));
         // When we run it, it should terminate the loop with error, as it propagates.
@@ -805,7 +792,7 @@ mod tests {
     struct Listener;
 
     impl Event<Option<SocketAddr>> for Listener {
-        fn init<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S) -> Response {
+        fn init<S: Scope<Option<SocketAddr>, Listener>>(&mut self, scope: &mut S) -> Response {
             // The port 0 = OS, please choose for me.
             let listener = TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))?;
             // And we need to know what the OS chose
@@ -816,7 +803,7 @@ mod tests {
             scope.io_register(listener, Ready::readable(), PollOpt::empty())?;
             Ok(true)
         }
-        fn io<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
+        fn io<S: Scope<Option<SocketAddr>, Listener>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
             assert_eq!(Ready::readable(), ready);
             err!(scope.with_io(id, |_stream: &mut TcpStream| -> Result<()> {
                 unreachable!();
@@ -834,7 +821,7 @@ mod tests {
 
     #[test]
     fn io() {
-        let mut l = Loop::new(None).unwrap();
+        let mut l: Loop<Option<SocketAddr>, Listener> = Loop::new(None).unwrap();
         l.insert(Listener).unwrap();
         assert_eq!(1, l.event_count());
         let mut addr: Option<SocketAddr> = None;
@@ -849,13 +836,13 @@ mod tests {
     struct Idle;
 
     impl Event<()> for Idle {
-        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+        fn init<S: Scope<(), Idle>>(&mut self, scope: &mut S) -> Response {
             scope.timeout_after(&Duration::new(10, 0));
             scope.idle();
             Ok(true)
         }
 
-        fn idle<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+        fn idle<S: Scope<(), Idle>>(&mut self, scope: &mut S) -> Response {
             scope.stop();
             Ok(false)
         }
@@ -868,7 +855,7 @@ mod tests {
          * If the idle doesn't fire, this would return error due to the timeout not being
          * implemented
          */
-        let mut l = Loop::new(()).unwrap();
+        let mut l: Loop<(), Idle> = Loop::new(()).unwrap();
         l.insert(Idle).unwrap();
         l.run().unwrap();
     }
