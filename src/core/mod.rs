@@ -9,11 +9,12 @@ use linked_hash_map::LinkedHashMap;
 use std::num::Wrapping;
 use std::any::Any;
 use std::collections::{VecDeque,BinaryHeap,HashSet};
-use std::marker::Sized;
+use std::marker::{Sized,PhantomData};
 use std::time::{Instant,Duration};
 use std::cmp::Ordering;
 use std::mem::replace;
 use std::convert::From;
+use std::any::TypeId;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct IoId {
@@ -31,6 +32,42 @@ pub struct Handle {
     generation: u64,
 }
 
+// TODO
+#[derive(Debug,Clone)]
+pub struct Channel<T: Any + Send> {
+    _data: PhantomData<T>,
+}
+
+impl<T: 'static + Send> Channel<T> {
+    pub fn send(data: T) -> Result<()> {
+        unimplemented!();
+    }
+}
+
+#[derive(Debug)]
+pub struct Message {
+    data: Box<Any>,
+    real_type: TypeId,
+    from: Option<Handle>,
+    mode: DeliveryMode,
+}
+
+impl Message {
+    fn get<T: Any>(self) -> Result<T> {
+
+        unimplemented!();
+    }
+    fn real_type(&self) -> &TypeId {
+        &self.real_type
+    }
+    fn from(&self) -> Option<Handle> {
+        self.from
+    }
+    fn mode(&self) -> &DeliveryMode {
+        &self.mode
+    }
+}
+
 pub trait LoopIface<Context, Ev> {
     fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny>;
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
@@ -42,6 +79,10 @@ pub trait LoopIface<Context, Ev> {
     fn event_count(&self) -> usize;
     // This one may be cached and little bit behind in case of long CPU computations
     fn now(&self) -> &Instant;
+    // Asynchronous send.
+    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()>;
+    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()>;
+    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>>;
 }
 
 pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
@@ -56,9 +97,47 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     fn io_remove(&mut self, id: IoId) -> Result<()>;
     fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R>;
     fn idle(&mut self);
+    // Say these messages are Ok
+    fn expect_message<T: Any>(&mut self);
+    /**
+     * Run a task in the background, in another thread.
+     *
+     * There is no guarantee when it gets run, or if the results come in order of submission. The
+     * result will get send through the `message` callback, with a `DeliveryMode` `Background`. You
+     * don't have to register the return type to receive it (and submitting a task with some return
+     * type doesn't register it for the ordinary messages).
+     */
+    fn background<R: Any + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
+    /**
+     * Run a task in a forked subprocess. The task result gets serialized and deserialized here.
+     *
+     * Otherwise it has similar behaviour than `background`.
+     */
+    // TODO: Only on unix?
+    // TODO: Trait for serializing and deserializing?
+    fn fork_task<R: Any, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
 }
 
 pub type Response = Result<bool>;
+
+#[derive(Debug,Clone,Copy,Eq,PartialEq,Ord,PartialOrd,Hash)]
+pub struct BackgroundId {
+    id: u64,
+}
+
+#[derive(Debug,Clone,Eq,PartialEq,Ord,PartialOrd,Hash)]
+pub enum DeliveryMode {
+    // Posted by who?
+    Post(Option<Handle>),
+    // Sent by who?
+    Send(Option<Handle>),
+    // Result of a background task
+    Background(BackgroundId),
+    // Result sent from forked task
+    Process(BackgroundId),
+    // Sent by some (possibly other) thread through a channel
+    Remote,
+}
 
 pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
     fn init<S: Scope<Context, ScopeEvent>>(&mut self, scope: &mut S) -> Response;
@@ -66,8 +145,7 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
     fn timeout<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
     fn signal<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
-    // XXX Any better interface? A way to directly send data to it? A separate trait?
-    //fn wakeup<S: Scope<Context, Self> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _data: Option<Box<Any>>) -> Response { Err(Error::DefaultImpl) }
+    fn message<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _msg: Message) -> Response { Err(Error::DefaultImpl) }
 }
 
 struct EvHolder<Event> {
@@ -488,6 +566,15 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
     }
     fn event_count(&self) -> usize { self.events.len() }
     fn now(&self) -> &Instant { &self.now }
+    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> {
+        unimplemented!();
+    }
+    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> {
+        unimplemented!();
+    }
+    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>> {
+        unimplemented!();
+    }
 }
 
 pub struct LoopScope<'a, Loop: 'a> {
@@ -516,6 +603,9 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'
     fn event_alive(&self, handle: Handle) -> bool { self.event_loop.event_alive(handle) }
     fn event_count(&self) -> usize { self.event_loop.event_count() }
     fn now(&self) -> &Instant { self.event_loop.now() }
+    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> { self.event_loop.send(handle, data) }
+    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> { self.event_loop.post(handle, data) }
+    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>> { self.event_loop.channel(handle) }
 }
 
 impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -563,6 +653,15 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
     }
     fn idle(&mut self) {
         self.event_loop.want_idle.insert(self.handle, ());
+    }
+    fn expect_message<T: Any>(&mut self) {
+        unimplemented!();
+    }
+    fn background<R: Any + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
+        unimplemented!();
+    }
+    fn fork_task<R: Any, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
+        unimplemented!();
     }
 }
 
