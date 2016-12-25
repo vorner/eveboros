@@ -16,6 +16,8 @@ pub enum Error {
     DeadLock,
     /// The referred event is not there
     Missing,
+    /// The referred IO is not there or not belonging to the current event
+    MissingIo,
     /**
      * The referred event is currently in the middle of a callback and
      * can't be bothered right now (you know, recursion).
@@ -23,6 +25,8 @@ pub enum Error {
     Busy,
     /// The loop is empty and tries to run
     Empty,
+    /// The requested IO is of a different type
+    IoType,
 }
 
 // TODO: Implement the error trait

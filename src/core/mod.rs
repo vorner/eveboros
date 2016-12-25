@@ -6,28 +6,33 @@ mod recycler;
 
 use self::recycler::Recycler;
 use error::{Result,Error};
-use mio::{Poll,Events,Token,Ready};
+use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
 use std::num::Wrapping;
 use std::any::Any;
-use std::collections::{VecDeque,BinaryHeap};
+use std::collections::{VecDeque,BinaryHeap,HashSet};
 use std::marker::Sized;
 use std::time::{Instant,Duration};
 use std::cmp::Ordering;
 use std::mem::replace;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
+pub struct IoId {
+    token: Token,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct TimeoutId {
     id: u64
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct Handle {
     id: usize,
     generation: u64,
 }
 
 pub trait LoopIface<Context> {
-    fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context);
+    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
     fn run_one(&mut self) -> Result<()>;
     fn run_until_complete(&mut self, handle: &Handle) -> Result<()>;
     fn run(&mut self) -> Result<()>;
@@ -45,6 +50,10 @@ pub trait Scope<Context>: LoopIface<Context> {
         let at = *self.now() + *after;
         self.timeout_at(at)
     }
+    fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId>;
+    fn io_update(&mut self, id: &IoId, interest: Ready, opts: PollOpt) -> Result<()>;
+    fn io_remove(&mut self, id: &IoId) -> Result<()>;
+    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: &IoId, f: F) -> Result<R>;
 }
 
 pub trait EvAccess<Context, Ev: Event<Context>> {
@@ -56,7 +65,7 @@ pub type Response = Result<bool>;
 
 pub trait Event<Context> where Self: Sized {
     fn init<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, scope: &mut S) -> Response;
-    fn io<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _token: &Token, _ready: &Ready) -> Response { Err(Error::DefaultImpl) }
+    fn io<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: &IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
     fn timeout<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: &TimeoutId) -> Response { Err(Error::DefaultImpl) }
     fn signal<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
@@ -73,12 +82,14 @@ struct EvHolder<Event> {
     generation: u64,
     // How many timeouts does it have?
     timeouts: usize,
+    // The actual Ids of this event holder (we need to drop them when the event dies)
+    ios: HashSet<IoId>,
     // Some other accounting data
 }
 
 #[derive(Debug)]
 enum TaskParam {
-    Io(Token, Ready),
+    Io(IoId, Ready),
     Timeout(TimeoutId),
     Signal(i8),
     Wakeup(Option<Box<Any>>),
@@ -109,6 +120,25 @@ impl PartialOrd for TimeoutHolder {
 }
 
 pub type ErrorHandler<Ev> = Box<FnMut(Ev, Error) -> Result<()>>;
+
+struct IoHolder<E: Evented> {
+    recipient: Handle,
+    io: E,
+}
+
+trait IoHolderAny: Any {
+    fn io(&self) -> &Evented;
+    fn recipient(&self) -> &Handle;
+    fn as_any_mut(&mut self) -> &mut Any;
+}
+
+impl<E: Evented + 'static> IoHolderAny for IoHolder<E> {
+    fn io(&self) -> &Evented { &self.io }
+    fn recipient(&self) -> &Handle { &self.recipient }
+    fn as_any_mut(&mut self) -> &mut Any { self }
+}
+
+const TOKEN_SHIFT: usize = 2;
 
 pub struct Loop<Context, Ev> {
     poll: Poll,
@@ -142,6 +172,8 @@ pub struct Loop<Context, Ev> {
     timeout_generation: Wrapping<u64>,
     // Cached from the last tick of the loop
     now: Instant,
+    ios: Recycler<Option<Box<IoHolderAny>>>,
+    ios_released: HashSet<usize>,
 }
 
 impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
@@ -166,6 +198,8 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             timeouts_inserted: 0,
             timeout_generation: Wrapping(0),
             now: Instant::now(),
+            ios: Recycler::new(),
+            ios_released: HashSet::new(),
         })
     }
     pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
@@ -268,6 +302,10 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
      */
     fn tasks_gather(&mut self) -> Result<()> {
         assert!(self.scheduled.is_empty());
+        // Release the IO ids we held, there are no more things in queue which could trigger them
+        for id in self.ios_released.drain() {
+            assert!(self.ios.release(id).is_none());
+        }
         if self.events.is_empty() {
             // We can't gather any tasks if there are no events, we would just block forever
             return Err(Error::Empty);
@@ -310,14 +348,31 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             Ok(())
             // TODO: If none added, look for idle tasks
         } else {
-            unimplemented!();
+            for ev in self.mio_events.iter() {
+                let Token(mut idx) = ev.token();
+                if idx >= TOKEN_SHIFT {
+                    idx -= TOKEN_SHIFT;
+                    /*
+                     * We should not get any invalid events or IOs now, we didn't fire any events
+                     * yet
+                     */
+                    self.scheduled.push_back(Task {
+                        recipient: self.ios[idx].as_ref().unwrap().recipient().clone(),
+                        param: TaskParam::Io(IoId { token: ev.token() }, ev.kind()),
+                    });
+                } else {
+                    // For now, we don't have the special FDs yet
+                    unreachable!();
+                }
+            }
+            Ok(())
         }
     }
 }
 
 impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
     /// Access the stored context
-    fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context) {
+    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> {
         f(&mut self.context)
     }
     fn run_one(&mut self) -> Result<()> {
@@ -330,7 +385,17 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
             let task = self.scheduled.pop_front().unwrap();
             if self.event_alive(&task.recipient) {
                 return match task.param {
-                    TaskParam::Io(_token, _ready) => unimplemented!(),
+                    TaskParam::Io(id, ready) => {
+                        let Token(mut idx) = id.token;
+                        idx -= TOKEN_SHIFT;
+                        // Check that the IO is still valid
+                        if self.ios.valid(idx) && self.ios[idx].is_some() {
+                            self.event_call(&task.recipient, |event, context| event.io(context, &id, ready))
+                        } else {
+                            // It's OK to lose the IO in the meantime
+                            Ok(())
+                        }
+                    },
                     TaskParam::Timeout(id) => {
                         self.timeouts_fired += 1;
                         self.events[task.recipient.id].timeouts -= 1;
@@ -386,6 +451,7 @@ impl<Context, Ev: Event<Context>> EvAccess<Context, Ev> for Loop<Context, Ev> {
             event: Some(event),
             generation: generation,
             timeouts: 0,
+            ios: HashSet::new(),
         });
         // Generate a handle for it
         let handle = Handle {
@@ -406,8 +472,19 @@ pub struct LoopScope<'a, Loop: 'a> {
     handle: Handle,
 }
 
+impl<'a, Context, Ev: Event<Context>> LoopScope<'a, Loop<Context, Ev>> {
+    fn io_idx(&mut self, id: &IoId) -> Result<usize> {
+        let Token(mut idx) = id.token;
+        idx -= TOKEN_SHIFT;
+        if !self.event_loop.ios.valid(idx) || self.event_loop.ios[idx].as_ref().map_or(true, |io| *io.recipient() != self.handle) {
+            return Err(Error::MissingIo);
+        }
+        Ok(idx)
+    }
+}
+
 impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<Context, Ev>> {
-    fn with_context<F>(&mut self, f: F) where F: FnOnce(&mut Context) { self.event_loop.with_context(f) }
+    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> { self.event_loop.with_context(f) }
     fn stop(&mut self) { self.event_loop.stop() }
     fn run_one(&mut self) -> Result<()> { self.event_loop.run_one() }
     fn run_until_complete(&mut self, handle: &Handle) -> Result<()> { self.event_loop.run_until_complete(handle) }
@@ -420,6 +497,46 @@ impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<
 impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> &Handle { &self.handle }
     fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(&self.handle, when) }
+    fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
+        let id = self.event_loop.ios.store(Some(Box::new(IoHolder {
+            recipient: self.handle.clone(),
+            io: io
+        })));
+        let token = Token(id + TOKEN_SHIFT);
+        if let Err(err) = self.event_loop.poll.register(self.event_loop.ios[id].as_ref().unwrap().io(), token, interest, opts) {
+            // If it fails, we want to get rid of the stored io first before returning the error
+            self.event_loop.ios.release(id);
+            return Err(Error::Io(err))
+        }
+        let id = IoId { token: token };
+        self.event_loop.events[self.handle.id].ios.insert(id.clone());
+        Ok(id)
+    }
+    fn io_update(&mut self, id: &IoId, interest: Ready, opts: PollOpt) -> Result<()> {
+        let idx = self.io_idx(id)?;
+        self.event_loop.poll.reregister(self.event_loop.ios[idx].as_ref().unwrap().io(), id.token, interest, opts).map_err(Error::Io)
+    }
+    fn io_remove(&mut self, id: &IoId) -> Result<()> {
+        let idx = self.io_idx(id)?;
+        // If the io is valid, remove it from both indexes
+        self.event_loop.events[self.handle.id].ios.remove(id);
+        /*
+         * Remove the registration.
+         *
+         * Note that we still keep the ID held and will release it only before we gather new tasks.
+         * This way we can prevent the ID being reused and get triggered by an old event.
+         */
+        self.event_loop.ios_released.insert(idx);
+        self.event_loop.poll.deregister(self.event_loop.ios[idx].take().unwrap().io()).map_err(Error::Io)
+        // TODO: Find a way to return the thing?
+    }
+    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: &IoId, f: F) -> Result<R> {
+        let idx = self.io_idx(id)?;
+        // Madness to get the real type of the object
+        let iob: Option<&mut Box<IoHolderAny>> = self.event_loop.ios[idx].as_mut();
+        let io: &mut IoHolder<E> = iob.unwrap().as_any_mut().downcast_mut().ok_or(Error::IoType)?;
+        f(&mut io.io)
+    }
 }
 
 impl<'a, Context, Ev: Event<Context>> EvAccess<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -431,16 +548,22 @@ impl<'a, Context, Ev: Event<Context>> EvAccess<Context, Ev> for LoopScope<'a, Lo
 mod tests {
     use super::*;
     use ::error::*;
+    use mio::tcp::{TcpListener,TcpStream};
+    use mio::{Ready,PollOpt};
     use std::rc::Rc;
     use std::cell::Cell;
     use std::time::Duration;
+    use std::net::{IpAddr,Ipv4Addr,SocketAddr};
+    use std::io::Write;
 
     struct InitAndContextEvent(Rc<Cell<bool>>);
 
     impl Event<bool> for InitAndContextEvent {
         fn init<S: Scope<bool>>(&mut self, scope: &mut S) -> Response {
-            scope.with_context(|c| *c = true);
-            Ok(false)
+            scope.with_context(|c| {
+                *c = true;
+                Ok(())
+            }).map(|_| false)
         }
     }
 
@@ -461,7 +584,10 @@ mod tests {
         let mut l = Loop::new(false).unwrap();
         let handle = l.insert(InitAndContextEvent(destroyed.clone())).unwrap();
         // Init got called (the context gets set to true there
-        l.with_context(|c| assert!(*c));
+        l.with_context(|c| {
+            assert!(*c);
+            Ok(())
+        }).unwrap();
         /*
          * As the event returns false from its init, the destructor should have gotten called
          * by now (even before the loop itself)
@@ -633,5 +759,49 @@ mod tests {
         // But if we try to run the loop long-term, it complains it is empty
         l.insert(ErrorTimeout).unwrap();
         err!(l.run(), Error::Empty);
+    }
+
+    struct Listener;
+
+    impl Event<Option<SocketAddr>> for Listener {
+        fn init<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S) -> Response {
+            // The port 0 = OS, please choose for me.
+            let listener = TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))?;
+            // And we need to know what the OS chose
+            scope.with_context(|c| {
+                *c = Some(listener.local_addr()?);
+                Ok(())
+            })?;
+            scope.io_register(listener, Ready::readable(), PollOpt::empty())?;
+            Ok(true)
+        }
+        fn io<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S, id: &IoId, ready: Ready) -> Response {
+            assert_eq!(Ready::readable(), ready);
+            err!(scope.with_io(id, |_stream: &mut TcpStream| -> Result<()> {
+                unreachable!();
+            }), Error::IoType);
+            scope.with_io(id, |listener: &mut TcpListener| {
+                let (mut stream, _) = listener.accept()?;
+                writeln!(stream, "hello").map_err(Error::Io)
+            })?;
+            scope.io_remove(id)?;
+            err!(scope.io_update(id, Ready::writable(), PollOpt::empty()), Error::MissingIo);
+            scope.stop();
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn io() {
+        let mut l = Loop::new(None).unwrap();
+        l.insert(Listener).unwrap();
+        assert_eq!(1, l.event_count());
+        let mut addr: Option<SocketAddr> = None;
+        l.with_context(|c| {
+            addr = c.take();
+            Ok(())
+        }).unwrap();
+        let _stream = TcpStream::connect(&addr.unwrap()).unwrap();
+        l.run().unwrap();
     }
 }
