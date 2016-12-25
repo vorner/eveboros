@@ -5,3 +5,4 @@ authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
 
 [dependencies]
 mio = "0.6"
+linked-hash-map = "0.3"

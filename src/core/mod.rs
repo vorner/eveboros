@@ -7,6 +7,7 @@ mod recycler;
 use self::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
+use linked_hash_map::LinkedHashMap;
 use std::num::Wrapping;
 use std::any::Any;
 use std::collections::{VecDeque,BinaryHeap,HashSet};
@@ -54,6 +55,7 @@ pub trait Scope<Context>: LoopIface<Context> {
     fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()>;
     fn io_remove(&mut self, id: IoId) -> Result<()>;
     fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R>;
+    fn idle(&mut self);
 }
 
 pub trait EvAccess<Context, Ev: Event<Context>> {
@@ -93,6 +95,7 @@ enum TaskParam {
     Timeout(TimeoutId),
     Signal(i8),
     Wakeup(Option<Box<Any>>),
+    Idle,
 }
 
 #[derive(Debug)]
@@ -174,6 +177,7 @@ pub struct Loop<Context, Ev> {
     now: Instant,
     ios: Recycler<Option<Box<IoHolderAny>>>,
     ios_released: HashSet<usize>,
+    want_idle: LinkedHashMap<Handle, ()>,
 }
 
 impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
@@ -200,6 +204,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             now: Instant::now(),
             ios: Recycler::new(),
             ios_released: HashSet::new(),
+            want_idle: LinkedHashMap::new(),
         })
     }
     pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
@@ -217,6 +222,11 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             // Make sure the Evented inside is destroyed. That'll deregister it from the Poll.
             self.ios[idx].take();
         }
+        /*
+         * There's no reasonable way to remove from the queue as well here, but the idle
+         * registrations should be short-lived, so it should drop out soon.
+         */
+        self.want_idle.remove(&Handle { id: idx, generation: event.generation });
         event.event
     }
     // Run function on an event, with the scope and result checking
@@ -288,6 +298,12 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
         while self.timeouts.peek().map_or(false, |t| !self.event_alive(t.recipient)) {
             self.timeouts.pop();
         }
+
+        if !self.want_idle.is_empty() {
+            // We have some idle tasks, so we run them whenever possible ‒ don't block
+            return Some(Duration::new(0, 0));
+        }
+
         // The computations may have taken some time, so get a fresh now.
         let now = Instant::now();
         self.timeouts.peek().map(|t| {
@@ -338,8 +354,8 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             self.timeouts_inserted = self.timeouts.len();
             // Check for too many dead ones in the storage
             if still_dead > 5 && still_alive * 3 < still_dead {
-                let mut old = replace(&mut self.timeouts, BinaryHeap::new());
-                let pruned: BinaryHeap<TimeoutHolder> = old.drain().filter(|ref t| self.event_alive(t.recipient)).collect();
+                let old = replace(&mut self.timeouts, BinaryHeap::new());
+                let pruned: BinaryHeap<TimeoutHolder> = old.into_iter().filter(|ref t| self.event_alive(t.recipient)).collect();
                 self.timeouts = pruned;
                 self.timeouts_dead = 0;
                 self.timeouts_inserted = self.timeouts.len();
@@ -352,6 +368,19 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
                     recipient: timeout.recipient,
                     param: TaskParam::Timeout(timeout.id),
                 })
+            }
+
+            /*
+             * If there were no timeouts, add one idle task (we don't want to put too many there,
+             * so we don't block the loop for too long.
+             */
+            if self.scheduled.is_empty() {
+                if let Some((handle, _)) = self.want_idle.pop_front() {
+                    self.scheduled.push_back(Task {
+                        recipient: handle,
+                        param: TaskParam::Idle,
+                    });
+                }
             }
             Ok(())
             // TODO: If none added, look for idle tasks
@@ -411,6 +440,7 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
                     },
                     TaskParam::Signal(_signal) => unimplemented!(),
                     TaskParam::Wakeup(_data) => unimplemented!(),
+                    TaskParam::Idle => self.event_call(task.recipient, |event, context| event.idle(context)),
                 }
             }
         }
@@ -544,6 +574,9 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
         let iob: Option<&mut Box<IoHolderAny>> = self.event_loop.ios[idx].as_mut();
         let io: &mut IoHolder<E> = iob.unwrap().as_any_mut().downcast_mut().ok_or(Error::IoType)?;
         f(&mut io.io)
+    }
+    fn idle(&mut self) {
+        self.event_loop.want_idle.insert(self.handle, ());
     }
 }
 
@@ -810,6 +843,33 @@ mod tests {
             Ok(())
         }).unwrap();
         let _stream = TcpStream::connect(&addr.unwrap()).unwrap();
+        l.run().unwrap();
+    }
+
+    struct Idle;
+
+    impl Event<()> for Idle {
+        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+            scope.timeout_after(&Duration::new(10, 0));
+            scope.idle();
+            Ok(true)
+        }
+
+        fn idle<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+            scope.stop();
+            Ok(false)
+        }
+        // The timeout is not implemented and would fail
+    }
+
+    #[test]
+    fn idle() {
+        /*
+         * If the idle doesn't fire, this would return error due to the timeout not being
+         * implemented
+         */
+        let mut l = Loop::new(()).unwrap();
+        l.insert(Idle).unwrap();
         l.run().unwrap();
     }
 }
