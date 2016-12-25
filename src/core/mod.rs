@@ -15,17 +15,17 @@ use std::time::{Instant,Duration};
 use std::cmp::Ordering;
 use std::mem::replace;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct IoId {
     token: Token,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct TimeoutId {
     id: u64
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Ord,PartialOrd)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct Handle {
     id: usize,
     generation: u64,
@@ -34,39 +34,39 @@ pub struct Handle {
 pub trait LoopIface<Context> {
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
     fn run_one(&mut self) -> Result<()>;
-    fn run_until_complete(&mut self, handle: &Handle) -> Result<()>;
+    fn run_until_complete(&mut self, handle: Handle) -> Result<()>;
     fn run(&mut self) -> Result<()>;
     fn stop(&mut self);
-    fn event_alive(&self, handle: &Handle) -> bool;
+    fn event_alive(&self, handle: Handle) -> bool;
     fn event_count(&self) -> usize;
     // This one may be cached and little bit behind in case of long CPU computations
     fn now(&self) -> &Instant;
 }
 
 pub trait Scope<Context>: LoopIface<Context> {
-    fn handle(&self) -> &Handle;
+    fn handle(&self) -> Handle;
     fn timeout_at(&mut self, when: Instant) -> TimeoutId;
     fn timeout_after(&mut self, after: &Duration) -> TimeoutId {
         let at = *self.now() + *after;
         self.timeout_at(at)
     }
     fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId>;
-    fn io_update(&mut self, id: &IoId, interest: Ready, opts: PollOpt) -> Result<()>;
-    fn io_remove(&mut self, id: &IoId) -> Result<()>;
-    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: &IoId, f: F) -> Result<R>;
+    fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()>;
+    fn io_remove(&mut self, id: IoId) -> Result<()>;
+    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R>;
 }
 
 pub trait EvAccess<Context, Ev: Event<Context>> {
     fn insert(&mut self, event: Ev) -> Result<Handle>;
-    fn post<Data>(&mut self, handle: &Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data>;
+    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data>;
 }
 
 pub type Response = Result<bool>;
 
 pub trait Event<Context> where Self: Sized {
     fn init<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, scope: &mut S) -> Response;
-    fn io<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: &IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
-    fn timeout<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: &TimeoutId) -> Response { Err(Error::DefaultImpl) }
+    fn io<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
+    fn timeout<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
     fn signal<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context> + EvAccess<Context, Self>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     // Any better interface? A way to directly send data to it? A separate trait?
@@ -128,13 +128,13 @@ struct IoHolder<E: Evented> {
 
 trait IoHolderAny: Any {
     fn io(&self) -> &Evented;
-    fn recipient(&self) -> &Handle;
+    fn recipient(&self) -> Handle;
     fn as_any_mut(&mut self) -> &mut Any;
 }
 
 impl<E: Evented + 'static> IoHolderAny for IoHolder<E> {
     fn io(&self) -> &Evented { &self.io }
-    fn recipient(&self) -> &Handle { &self.recipient }
+    fn recipient(&self) -> Handle { self.recipient }
     fn as_any_mut(&mut self) -> &mut Any { self }
 }
 
@@ -212,7 +212,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
         event.event
     }
     // Run function on an event, with the scope and result checking
-    fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: &Handle, f: F) -> Result<()> {
+    fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: Handle, f: F) -> Result<()> {
         // First check both the index and generation
         if !self.events.valid(handle.id) {
             return Err(Error::Missing)
@@ -226,7 +226,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             let result = {
                 let mut scope: LoopScope<Self> = LoopScope {
                     event_loop: self,
-                    handle: handle.clone(),
+                    handle: handle,
                 };
                 f(&mut event, &mut scope)
             };
@@ -251,7 +251,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             Err(Error::Busy)
         }
     }
-    fn timeout_at(&mut self, handle: &Handle, when: Instant) -> TimeoutId {
+    fn timeout_at(&mut self, handle: Handle, when: Instant) -> TimeoutId {
         // Generate an ID for the timeout
         let Wrapping(id) = self.timeout_generation;
         let id = TimeoutId { id: id };
@@ -261,8 +261,8 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
         self.timeouts_inserted += 1;
 
         self.timeouts.push(TimeoutHolder {
-            id: id.clone(),
-            recipient: handle.clone(),
+            id: id,
+            recipient: handle,
             when: when
         });
 
@@ -277,7 +277,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
          * First, get rid of all timeouts to dead events (since we don't want to wake up because of
          * them).
          */
-        while self.timeouts.peek().map_or(false, |t| !self.event_alive(&t.recipient)) {
+        while self.timeouts.peek().map_or(false, |t| !self.event_alive(t.recipient)) {
             self.timeouts.pop();
         }
         // The computations may have taken some time, so get a fresh now.
@@ -331,7 +331,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             // Check for too many dead ones in the storage
             if still_dead > 5 && still_alive * 3 < still_dead {
                 let mut old = replace(&mut self.timeouts, BinaryHeap::new());
-                let pruned: BinaryHeap<TimeoutHolder> = old.drain().filter(|ref t| self.event_alive(&t.recipient)).collect();
+                let pruned: BinaryHeap<TimeoutHolder> = old.drain().filter(|ref t| self.event_alive(t.recipient)).collect();
                 self.timeouts = pruned;
                 self.timeouts_dead = 0;
                 self.timeouts_inserted = self.timeouts.len();
@@ -357,7 +357,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
                      * yet
                      */
                     self.scheduled.push_back(Task {
-                        recipient: self.ios[idx].as_ref().unwrap().recipient().clone(),
+                        recipient: self.ios[idx].as_ref().unwrap().recipient(),
                         param: TaskParam::Io(IoId { token: ev.token() }, ev.kind()),
                     });
                 } else {
@@ -383,14 +383,14 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
                 self.tasks_gather()?
             }
             let task = self.scheduled.pop_front().unwrap();
-            if self.event_alive(&task.recipient) {
+            if self.event_alive(task.recipient) {
                 return match task.param {
                     TaskParam::Io(id, ready) => {
                         let Token(mut idx) = id.token;
                         idx -= TOKEN_SHIFT;
                         // Check that the IO is still valid
                         if self.ios.valid(idx) && self.ios[idx].is_some() {
-                            self.event_call(&task.recipient, |event, context| event.io(context, &id, ready))
+                            self.event_call(task.recipient, |event, context| event.io(context, id, ready))
                         } else {
                             // It's OK to lose the IO in the meantime
                             Ok(())
@@ -399,7 +399,7 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
                     TaskParam::Timeout(id) => {
                         self.timeouts_fired += 1;
                         self.events[task.recipient.id].timeouts -= 1;
-                        self.event_call(&task.recipient, |event, context| event.timeout(context, &id))
+                        self.event_call(task.recipient, |event, context| event.timeout(context, id))
                     },
                     TaskParam::Signal(_signal) => unimplemented!(),
                     TaskParam::Wakeup(_data) => unimplemented!(),
@@ -407,7 +407,7 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
             }
         }
     }
-    fn run_until_complete(&mut self, handle: &Handle) -> Result<()> {
+    fn run_until_complete(&mut self, handle: Handle) -> Result<()> {
         let mut checked = false;
         while self.event_alive(handle) {
             /*
@@ -434,7 +434,7 @@ impl<Context, Ev: Event<Context>> LoopIface<Context> for Loop<Context, Ev> {
     fn stop(&mut self) {
         self.active = false;
     }
-    fn event_alive(&self, handle: &Handle) -> bool {
+    fn event_alive(&self, handle: Handle) -> bool {
         self.events.valid(handle.id) && self.events[handle.id].generation == handle.generation
     }
     fn event_count(&self) -> usize { self.events.len() }
@@ -459,10 +459,10 @@ impl<Context, Ev: Event<Context>> EvAccess<Context, Ev> for Loop<Context, Ev> {
             generation: generation
         };
         // Run the init for the event
-        self.event_call(&handle, |event, context| event.init(context))?;
+        self.event_call(handle, |event, context| event.init(context))?;
         Ok(handle)
     }
-    fn post<Data>(&mut self, handle: &Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> {
+    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> {
         self.event_call(handle, |event, scope| event.deliver(scope, data))
     }
 }
@@ -473,10 +473,10 @@ pub struct LoopScope<'a, Loop: 'a> {
 }
 
 impl<'a, Context, Ev: Event<Context>> LoopScope<'a, Loop<Context, Ev>> {
-    fn io_idx(&mut self, id: &IoId) -> Result<usize> {
+    fn io_idx(&mut self, id: IoId) -> Result<usize> {
         let Token(mut idx) = id.token;
         idx -= TOKEN_SHIFT;
-        if !self.event_loop.ios.valid(idx) || self.event_loop.ios[idx].as_ref().map_or(true, |io| *io.recipient() != self.handle) {
+        if !self.event_loop.ios.valid(idx) || self.event_loop.ios[idx].as_ref().map_or(true, |io| io.recipient() != self.handle) {
             return Err(Error::MissingIo);
         }
         Ok(idx)
@@ -487,19 +487,19 @@ impl<'a, Context, Ev: Event<Context>> LoopIface<Context> for LoopScope<'a, Loop<
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> { self.event_loop.with_context(f) }
     fn stop(&mut self) { self.event_loop.stop() }
     fn run_one(&mut self) -> Result<()> { self.event_loop.run_one() }
-    fn run_until_complete(&mut self, handle: &Handle) -> Result<()> { self.event_loop.run_until_complete(handle) }
+    fn run_until_complete(&mut self, handle: Handle) -> Result<()> { self.event_loop.run_until_complete(handle) }
     fn run(&mut self) -> Result<()> { self.event_loop.run() }
-    fn event_alive(&self, handle: &Handle) -> bool { self.event_loop.event_alive(handle) }
+    fn event_alive(&self, handle: Handle) -> bool { self.event_loop.event_alive(handle) }
     fn event_count(&self) -> usize { self.event_loop.event_count() }
     fn now(&self) -> &Instant { self.event_loop.now() }
 }
 
 impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Context, Ev>> {
-    fn handle(&self) -> &Handle { &self.handle }
-    fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(&self.handle, when) }
+    fn handle(&self) -> Handle { self.handle }
+    fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(self.handle, when) }
     fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
         let id = self.event_loop.ios.store(Some(Box::new(IoHolder {
-            recipient: self.handle.clone(),
+            recipient: self.handle,
             io: io
         })));
         let token = Token(id + TOKEN_SHIFT);
@@ -509,17 +509,17 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
             return Err(Error::Io(err))
         }
         let id = IoId { token: token };
-        self.event_loop.events[self.handle.id].ios.insert(id.clone());
+        self.event_loop.events[self.handle.id].ios.insert(id);
         Ok(id)
     }
-    fn io_update(&mut self, id: &IoId, interest: Ready, opts: PollOpt) -> Result<()> {
+    fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()> {
         let idx = self.io_idx(id)?;
         self.event_loop.poll.reregister(self.event_loop.ios[idx].as_ref().unwrap().io(), id.token, interest, opts).map_err(Error::Io)
     }
-    fn io_remove(&mut self, id: &IoId) -> Result<()> {
+    fn io_remove(&mut self, id: IoId) -> Result<()> {
         let idx = self.io_idx(id)?;
         // If the io is valid, remove it from both indexes
-        self.event_loop.events[self.handle.id].ios.remove(id);
+        self.event_loop.events[self.handle.id].ios.remove(&id);
         /*
          * Remove the registration.
          *
@@ -530,7 +530,7 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
         self.event_loop.poll.deregister(self.event_loop.ios[idx].take().unwrap().io()).map_err(Error::Io)
         // TODO: Find a way to return the thing?
     }
-    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: &IoId, f: F) -> Result<R> {
+    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R> {
         let idx = self.io_idx(id)?;
         // Madness to get the real type of the object
         let iob: Option<&mut Box<IoHolderAny>> = self.event_loop.ios[idx].as_mut();
@@ -541,7 +541,7 @@ impl<'a, Context, Ev: Event<Context>> Scope<Context> for LoopScope<'a, Loop<Cont
 
 impl<'a, Context, Ev: Event<Context>> EvAccess<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn insert(&mut self, event: Ev) -> Result<Handle> { self.event_loop.insert(event) }
-    fn post<Data>(&mut self, handle: &Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> { self.event_loop.post(handle, data) }
+    fn post<Data>(&mut self, handle: Handle, data: Data) -> Result<()> where Ev: Postable<Context, Data> { self.event_loop.post(handle, data) }
 }
 
 #[cfg(test)]
@@ -594,9 +594,9 @@ mod tests {
          */
         assert!(destroyed.get());
         // And it is not alive (obviously)
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // As it is not alive, run_until_complete finishes right away
-        l.run_until_complete(&handle).unwrap();
+        l.run_until_complete(handle).unwrap();
         assert_eq!(0, l.event_count());
     }
 
@@ -629,21 +629,21 @@ mod tests {
         // Create an event that stays there, at least for a while
         let mut l = Loop::new(()).unwrap();
         let handle = l.insert(Recipient).unwrap();
-        assert!(l.event_alive(&handle));
+        assert!(l.event_alive(handle));
         // Post something to it (successfully)
-        l.post(&handle, ()).unwrap();
+        l.post(handle, ()).unwrap();
         // But it received it and went away
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // And if we try to send again, it fails with Missing
-        err!(l.post(&handle, ()), Error::Missing);
+        err!(l.post(handle, ()), Error::Missing);
     }
 
     struct Recurse;
     // Recurse to self
     impl<C> Postable<C, Recurse> for Recipient {
         fn deliver<S: Scope<C> + EvAccess<C, Self>>(&mut self, scope: &mut S, data: Recurse) -> Response {
-            let handle = scope.handle().clone();
-            scope.post(&handle, data)?;
+            let handle = scope.handle();
+            scope.post(handle, data)?;
             Ok(true)
         }
     }
@@ -656,14 +656,14 @@ mod tests {
         // Create an event that stays there
         let mut l = Loop::new(()).unwrap();
         let handle = l.insert(Recipient).unwrap();
-        assert!(l.event_alive(&handle));
+        assert!(l.event_alive(handle));
         // Post a Recurse to it, which would create an infinite recursion of posting to self
-        err!(l.post(&handle, Recurse), Error::Busy);
+        err!(l.post(handle, Recurse), Error::Busy);
         /*
          * As it returned error, it got killed (it returned error because it called itself, not
          * because it was called while busy).
          */
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
     }
 
     // An event that terminates after given amount of milliseconds
@@ -683,8 +683,8 @@ mod tests {
             Ok(true)
         }
         // Terminate on the first timeout we get
-        fn timeout<S>(&mut self, _scope: &mut S, id: &TimeoutId) -> Response {
-            assert_eq!(Some(id.clone()), self.id);
+        fn timeout<S>(&mut self, _scope: &mut S, id: TimeoutId) -> Response {
+            assert_eq!(Some(id), self.id);
             Ok(false)
         }
     }
@@ -697,24 +697,24 @@ mod tests {
             id: None,
         }).unwrap();
         // It is alive, because it needs the loop to turn to get the timeout
-        assert!(l.event_alive(&handle));
+        assert!(l.event_alive(handle));
         // We can wait for it to happen. Only one timeout gets called (checked in the event)
-        l.run_until_complete(&handle).unwrap();
+        l.run_until_complete(handle).unwrap();
         // Add another one that needs to wait a while and check it actually waited
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // Add another event
         let handle_wait = l.insert(Timeouter {
             milliseconds: 500,
             id: None,
         }).unwrap();
         // The old one didn't get resurrected
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // The new one lives
-        assert!(l.event_alive(&handle_wait));
+        assert!(l.event_alive(handle_wait));
         let wait_start = l.now().clone();
         // It should just fire the one event here
         l.run_one().unwrap();
-        assert!(!l.event_alive(&handle_wait));
+        assert!(!l.event_alive(handle_wait));
         assert!(l.now().duration_since(wait_start) >= Duration::new(0, 500));
         // Check dead-timeouts stats. They got adjusted before the run of the second event.
         assert_eq!(2, l.timeouts_inserted);
@@ -741,21 +741,21 @@ mod tests {
     fn error_handler() {
         let mut l = Loop::new(()).unwrap();
         let handle = l.insert(ErrorTimeout).unwrap();
-        assert!(l.event_alive(&handle));
+        assert!(l.event_alive(handle));
         // When we run it, it should terminate the loop with error, as it propagates.
         err!(l.run(), Error::DefaultImpl);
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // Return some other random error
         l.error_handler_set(Box::new(|_, _| Err(Error::DeadLock)));
         // When we run that failing thing through, it changes the error by the handler
         let handle = l.insert(ErrorTimeout).unwrap();
         err!(l.run(), Error::DeadLock);
-        assert!(!l.event_alive(&handle));
+        assert!(!l.event_alive(handle));
         // When we ignore the error, it just lets the event die
         let handle = l.insert(ErrorTimeout).unwrap();
         l.error_handler_set(Box::new(|_, _| Ok(())));
-        l.run_until_complete(&handle).unwrap();
-        assert!(!l.event_alive(&handle));
+        l.run_until_complete(handle).unwrap();
+        assert!(!l.event_alive(handle));
         // But if we try to run the loop long-term, it complains it is empty
         l.insert(ErrorTimeout).unwrap();
         err!(l.run(), Error::Empty);
@@ -775,7 +775,7 @@ mod tests {
             scope.io_register(listener, Ready::readable(), PollOpt::empty())?;
             Ok(true)
         }
-        fn io<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S, id: &IoId, ready: Ready) -> Response {
+        fn io<S: Scope<Option<SocketAddr>>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
             assert_eq!(Ready::readable(), ready);
             err!(scope.with_io(id, |_stream: &mut TcpStream| -> Result<()> {
                 unreachable!();
