@@ -33,7 +33,7 @@ pub struct Handle {
     generation: u64,
 }
 
-pub trait LoopIface<Context, Ev> {
+pub trait LoopIface<Context, Ev: ?Sized> {
     fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny>;
     fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
     fn run_one(&mut self) -> Result<()>;
@@ -46,7 +46,7 @@ pub trait LoopIface<Context, Ev> {
     fn now(&self) -> &Instant;
 }
 
-pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
+pub trait Scope<Context, Ev: ?Sized>: LoopIface<Context, Ev> {
     fn handle(&self) -> Handle;
     fn timeout_at(&mut self, when: Instant) -> TimeoutId;
     fn timeout_after(&mut self, after: &Duration) -> TimeoutId {
@@ -62,7 +62,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
 
 pub type Response = Result<bool>;
 
-pub trait Event<Context> where Self: Sized {
+pub trait Event<Context> {
     fn init<S: Scope<Context, Self>>(&mut self, scope: &mut S) -> Response;
     fn io<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
     fn timeout<S: Scope<Context, Self>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
