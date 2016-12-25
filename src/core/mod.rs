@@ -2,8 +2,6 @@ mod recycler;
 
 // TODO: Some logging
 
-// TODO: How do we propagate errors? Kill the loop? Error handler?
-
 use self::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
