@@ -16,7 +16,9 @@ use std::cmp::Ordering;
 use std::mem::replace;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub struct TimeoutId(u64);
+pub struct TimeoutId {
+    id: u64
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct Handle {
@@ -218,7 +220,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
     fn timeout_at(&mut self, handle: &Handle, when: Instant) -> TimeoutId {
         // Generate an ID for the timeout
         let Wrapping(id) = self.timeout_generation;
-        let id = TimeoutId(id);
+        let id = TimeoutId { id: id };
         self.timeout_generation += Wrapping(1);
         // This gets called only through the event's context, so it's safe
         self.events[handle.id].timeouts += 1;
