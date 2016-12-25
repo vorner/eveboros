@@ -111,6 +111,11 @@ impl<T> Recycler<T> {
     pub fn len(&self) -> usize {
         self.data.len() - self.free.len()
     }
+
+    /// Is it empty of any content?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<T> Index<usize> for Recycler<T> {
@@ -142,6 +147,7 @@ mod tests {
         assert_eq!(0, r.data.len());
         assert_eq!(0, r.free.len());
         assert_eq!(0, r.len());
+        assert!(r.is_empty());
 
         // Store something and observe it is there
         assert_eq!(0, r.store(1));
@@ -151,6 +157,7 @@ mod tests {
         assert_eq!(2, r.data.len());
         assert_eq!(vec![Some(1), Some(2)], r.data);
         assert_eq!(2, r.len());
+        assert!(!r.is_empty());
 
         // Indexing checks
         assert_eq!(1, r[0]);

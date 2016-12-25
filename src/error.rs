@@ -20,7 +20,9 @@ pub enum Error {
      * The referred event is currently in the middle of a callback and
      * can't be bothered right now (you know, recursion).
      */
-    Busy
+    Busy,
+    /// The loop is empty and tries to run
+    Empty,
 }
 
 // TODO: Implement the error trait

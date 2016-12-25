@@ -106,11 +106,14 @@ impl PartialOrd for TimeoutHolder {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
+pub type ErrorHandler<Ev> = Box<FnMut(Ev, Error) -> Result<()>>;
+
 pub struct Loop<Context, Ev> {
     poll: Poll,
     mio_events: Events,
     active: bool,
     context: Context,
+    error_handler: ErrorHandler<Ev>,
     events: Recycler<EvHolder<Ev>>,
     /*
      * We try to detect referring to an event with Handle from event that had the same index as us
@@ -151,6 +154,7 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             mio_events: Events::with_capacity(1024),
             active: false,
             context: context,
+            error_handler: Box::new(|_, error| Err(error)),
             events: Recycler::new(),
             generation: Wrapping(0),
             scheduled: VecDeque::new(),
@@ -162,12 +166,14 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             now: Instant::now(),
         })
     }
+    pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
     /// Kill an event at given index.
-    fn event_kill(&mut self, idx: usize) {
+    fn event_kill(&mut self, idx: usize) -> Option<Ev> {
         // TODO: Some other handling, like killing its IOs, timers, etc
         let event = self.events.release(idx);
         // These timeouts are dead now
         self.timeouts_dead += event.timeouts;
+        event.event
     }
     // Run function on an event, with the scope and result checking
     fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: &Handle, f: F) -> Result<()> {
@@ -192,14 +198,18 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
             self.events[handle.id].event = Some(event);
             match result {
                 Ok(true) => (), // Keep the event alive
-                /*
-                 * Kill it either because it failed or because it said it doesn't want to continue
-                 * any more.
-                 */
-                _ => self.event_kill(handle.id)
+                Ok(false) => { self.event_kill(handle.id); }, // Kill it as asked for
+                Err(err) => {
+                    // We can unwrap, we just returned the event there a moment ago
+                    let event = self.event_kill(handle.id).unwrap();
+                    /*
+                     * Call the error handler with the broken event and propagate any error it
+                     * returns
+                     */
+                    (self.error_handler)(event, err)?;
+                }
             }
-            // Get rid of the Ok content, but leave error intact
-            result.map(|_| ())
+            Ok(())
         } else {
             // Not there, but the holder is ‒ it must sit on some outer stack frame, being called
             Err(Error::Busy)
@@ -256,6 +266,10 @@ impl<Context, Ev: Event<Context>> Loop<Context, Ev> {
      */
     fn tasks_gather(&mut self) -> Result<()> {
         assert!(self.scheduled.is_empty());
+        if self.events.is_empty() {
+            // We can't gather any tasks if there are no events, we would just block forever
+            return Err(Error::Empty);
+        }
         let wakeup = self.timeout_min();
         self.poll.poll(&mut self.mio_events, wakeup)?;
         // We slept a while, update the now cache
@@ -583,5 +597,39 @@ mod tests {
          * The one left may be either in the scheduled list or in timouts heap.
          */
         assert_eq!(1, l.timeouts.len() + l.scheduled.len());
+    }
+
+    struct ErrorTimeout;
+
+    impl Event<()> for ErrorTimeout {
+        fn init<S: Scope<()>>(&mut self, scope: &mut S) -> Response {
+            scope.timeout_after(&Duration::new(0, 0));
+            Ok(true)
+        }
+        // The timeout is not implemented, so the default returns an error
+    }
+
+    #[test]
+    fn error_handler() {
+        let mut l = Loop::new(()).unwrap();
+        let handle = l.insert(ErrorTimeout).unwrap();
+        assert!(l.event_alive(&handle));
+        // When we run it, it should terminate the loop with error, as it propagates.
+        err!(l.run(), Error::DefaultImpl);
+        assert!(!l.event_alive(&handle));
+        // Return some other random error
+        l.error_handler_set(Box::new(|_, _| Err(Error::DeadLock)));
+        // When we run that failing thing through, it changes the error by the handler
+        let handle = l.insert(ErrorTimeout).unwrap();
+        err!(l.run(), Error::DeadLock);
+        assert!(!l.event_alive(&handle));
+        // When we ignore the error, it just lets the event die
+        let handle = l.insert(ErrorTimeout).unwrap();
+        l.error_handler_set(Box::new(|_, _| Ok(())));
+        l.run_until_complete(&handle).unwrap();
+        assert!(!l.event_alive(&handle));
+        // But if we try to run the loop long-term, it complains it is empty
+        l.insert(ErrorTimeout).unwrap();
+        err!(l.run(), Error::Empty);
     }
 }
