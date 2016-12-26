@@ -8,7 +8,7 @@ use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
 use linked_hash_map::LinkedHashMap;
 use std::num::Wrapping;
 use std::any::Any;
-use std::collections::{VecDeque,BinaryHeap,HashSet};
+use std::collections::{VecDeque,BinaryHeap,HashSet,HashMap};
 use std::marker::{Sized,PhantomData};
 use std::time::{Instant,Duration};
 use std::cmp::Ordering;
@@ -153,8 +153,8 @@ struct EvHolder<Event> {
     generation: u64,
     // How many timeouts does it have?
     timeouts: usize,
-    // The actual Ids of this event holder (we need to drop them when the event dies)
-    ios: HashSet<IoId>,
+    // The IOs belonging to this event
+    ios: HashMap<usize, Box<IoHolderAny>>,
     // Some other accounting data
 }
 
@@ -244,7 +244,8 @@ pub struct Loop<Context, Ev> {
     timeout_generation: Wrapping<u64>,
     // Cached from the last tick of the loop
     now: Instant,
-    ios: Recycler<Option<Box<IoHolderAny>>>,
+    // Ownership of the IOs
+    ios: Recycler<Handle>,
     ios_released: HashSet<usize>,
     want_idle: LinkedHashMap<Handle, ()>,
 }
@@ -283,18 +284,11 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         let event = self.events.release(idx);
         // These timeouts are dead now
         self.timeouts_dead += event.timeouts;
-        // Deregister the IOs
-        for io in event.ios {
-            let Token(mut idx) = io.token;
-            idx -= TOKEN_SHIFT;
-            self.ios_released.insert(idx);
-            // Make sure the Evented inside is destroyed. That'll deregister it from the Poll.
-            self.ios[idx].take();
+        // Deregister the IOs (the IDs are deregistered in a delayed way)
+        for (k, v) in event.ios.into_iter() {
+            self.poll.deregister(v.io()).unwrap(); // Must not fail, this one is valid
+            self.ios_released.insert(k);
         }
-        /*
-         * There's no reasonable way to remove from the queue as well here, but the idle
-         * registrations should be short-lived, so it should drop out soon.
-         */
         self.want_idle.remove(&Handle { id: idx, generation: event.generation });
         event.event
     }
@@ -397,7 +391,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         assert!(self.scheduled.is_empty());
         // Release the IO ids we held, there are no more things in queue which could trigger them
         for id in self.ios_released.drain() {
-            assert!(self.ios.release(id).is_none());
+            self.ios.release(id);
         }
         if self.events.is_empty() {
             // We can't gather any tasks if there are no events, we would just block forever
@@ -463,7 +457,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
                      * yet
                      */
                     self.scheduled.push_back(Task {
-                        recipient: self.ios[idx].as_ref().unwrap().recipient(),
+                        recipient: self.ios[idx],
                         param: TaskParam::Io(IoId { token: ev.token() }, ev.kind()),
                     });
                 } else {
@@ -486,7 +480,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
             event: Some(event.into()),
             generation: generation,
             timeouts: 0,
-            ios: HashSet::new(),
+            ios: HashMap::new(),
         });
         // Generate a handle for it
         let handle = Handle {
@@ -515,7 +509,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                         let Token(mut idx) = id.token;
                         idx -= TOKEN_SHIFT;
                         // Check that the IO is still valid
-                        if self.ios.valid(idx) && self.ios[idx].is_some() {
+                        if self.events[task.recipient.id].ios.contains_key(&idx) {
                             self.event_call(task.recipient, |event, context| event.io(context, id, ready))
                         } else {
                             // It's OK to lose the IO in the meantime
@@ -586,10 +580,11 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopScope<'a, Loop<Context, Ev>> {
     fn io_idx(&mut self, id: IoId) -> Result<usize> {
         let Token(mut idx) = id.token;
         idx -= TOKEN_SHIFT;
-        if !self.event_loop.ios.valid(idx) || self.event_loop.ios[idx].as_ref().map_or(true, |io| io.recipient() != self.handle) {
-            return Err(Error::MissingIo);
+        if self.event_loop.events[self.handle.id].ios.contains_key(&idx) {
+            Ok(idx)
+        } else {
+            Err(Error::MissingIo)
         }
-        Ok(idx)
     }
 }
 
@@ -612,28 +607,28 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
     fn handle(&self) -> Handle { self.handle }
     fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(self.handle, when) }
     fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
-        let id = self.event_loop.ios.store(Some(Box::new(IoHolder {
-            recipient: self.handle,
-            io: io
-        })));
+        let id = self.event_loop.ios.store(self.handle);
         let token = Token(id + TOKEN_SHIFT);
-        if let Err(err) = self.event_loop.poll.register(self.event_loop.ios[id].as_ref().unwrap().io(), token, interest, opts) {
+        if let Err(err) = self.event_loop.poll.register(&io, token, interest, opts) {
             // If it fails, we want to get rid of the stored io first before returning the error
             self.event_loop.ios.release(id);
             return Err(Error::Io(err))
         }
-        let id = IoId { token: token };
-        self.event_loop.events[self.handle.id].ios.insert(id);
-        Ok(id)
+        self.event_loop.events[self.handle.id].ios.insert(id, Box::new(IoHolder {
+            recipient: self.handle,
+            io: io
+        }));
+        Ok(IoId { token: token })
     }
     fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()> {
         let idx = self.io_idx(id)?;
-        self.event_loop.poll.reregister(self.event_loop.ios[idx].as_ref().unwrap().io(), id.token, interest, opts).map_err(Error::Io)
+        self.event_loop.poll.reregister(self.event_loop.events[self.handle.id].ios[&idx].io(), id.token, interest, opts).map_err(Error::Io)
     }
     fn io_remove(&mut self, id: IoId) -> Result<()> {
         let idx = self.io_idx(id)?;
         // If the io is valid, remove it from both indexes
-        self.event_loop.events[self.handle.id].ios.remove(&id);
+        let io = self.event_loop.events[self.handle.id].ios.remove(&idx).unwrap();
+        self.event_loop.ios.release(idx);
         /*
          * Remove the registration.
          *
@@ -641,14 +636,13 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
          * This way we can prevent the ID being reused and get triggered by an old event.
          */
         self.event_loop.ios_released.insert(idx);
-        self.event_loop.poll.deregister(self.event_loop.ios[idx].take().unwrap().io()).map_err(Error::Io)
+        self.event_loop.poll.deregister(io.io()).map_err(Error::Io)
         // TODO: Find a way to return the thing?
     }
     fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R> {
         let idx = self.io_idx(id)?;
         // Madness to get the real type of the object
-        let iob: Option<&mut Box<IoHolderAny>> = self.event_loop.ios[idx].as_mut();
-        let io: &mut IoHolder<E> = iob.unwrap().as_any_mut().downcast_mut().ok_or(Error::IoType)?;
+        let io: &mut IoHolder<E> = self.event_loop.events[self.handle.id].ios.get_mut(&idx).unwrap().as_any_mut().downcast_mut().ok_or(Error::IoType)?;
         f(&mut io.io)
     }
     fn idle(&mut self) {
