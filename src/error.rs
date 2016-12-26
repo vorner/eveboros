@@ -31,6 +31,8 @@ pub enum Error {
     MsgType,
     /// Message type not expected, can't send
     MsgUnexpected,
+    /// The recipient loop of the Channel was destroyed
+    LoopGone,
 }
 
 // TODO: Implement the error trait
