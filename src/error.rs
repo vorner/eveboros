@@ -33,6 +33,8 @@ pub enum Error {
     MsgUnexpected,
     /// The recipient loop of the Channel was destroyed
     LoopGone,
+    /// The background task panicked
+    BackgroundPanicked,
 }
 
 // TODO: Implement the error trait

@@ -85,6 +85,7 @@
 
 extern crate mio;
 extern crate linked_hash_map;
+extern crate threadpool;
 
 pub mod error;
 mod core;
