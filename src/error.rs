@@ -27,6 +27,10 @@ pub enum Error {
     Empty,
     /// The requested IO is of a different type
     IoType,
+    /// The requested type of the message does not match (when extracting)
+    MsgType,
+    /// Message type not expected, can't send
+    MsgUnexpected,
 }
 
 // TODO: Implement the error trait

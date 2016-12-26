@@ -34,7 +34,7 @@ pub struct Handle {
 
 // TODO
 #[derive(Debug,Clone)]
-pub struct Channel<T: Any + Send> {
+pub struct Channel<T: Any + 'static + Send> {
     _data: PhantomData<T>,
 }
 
@@ -46,26 +46,17 @@ impl<T: 'static + Send> Channel<T> {
 
 #[derive(Debug)]
 pub struct Message {
-    data: Box<Any>,
+    data: Box<Any + 'static>,
     real_type: TypeId,
-    from: Option<Handle>,
     mode: DeliveryMode,
 }
 
 impl Message {
-    fn get<T: Any>(self) -> Result<T> {
-
-        unimplemented!();
+    fn get<T: Any + 'static>(self) -> Result<T> {
+        self.data.downcast().map_err(|_| Error::MsgType).map(|b| *b)
     }
-    fn real_type(&self) -> &TypeId {
-        &self.real_type
-    }
-    fn from(&self) -> Option<Handle> {
-        self.from
-    }
-    fn mode(&self) -> &DeliveryMode {
-        &self.mode
-    }
+    fn real_type(&self) -> &TypeId { &self.real_type }
+    fn mode(&self) -> &DeliveryMode { &self.mode }
 }
 
 pub trait LoopIface<Context, Ev> {
@@ -80,9 +71,9 @@ pub trait LoopIface<Context, Ev> {
     // This one may be cached and little bit behind in case of long CPU computations
     fn now(&self) -> &Instant;
     // Asynchronous send.
-    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()>;
-    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()>;
-    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>>;
+    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()>;
+    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()>;
+    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>>;
 }
 
 pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
@@ -107,7 +98,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      * don't have to register the return type to receive it (and submitting a task with some return
      * type doesn't register it for the ordinary messages).
      */
-    fn background<R: Any + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
+    fn background<R: Any + 'static + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
     /**
      * Run a task in a forked subprocess. The task result gets serialized and deserialized here.
      *
@@ -115,7 +106,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      */
     // TODO: Only on unix?
     // TODO: Trait for serializing and deserializing?
-    fn fork_task<R: Any, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
+    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId>;
 }
 
 pub type Response = Result<bool>;
@@ -155,6 +146,7 @@ struct EvHolder<Event> {
     timeouts: usize,
     // The IOs belonging to this event
     ios: HashMap<usize, Box<IoHolderAny>>,
+    expected_messages: HashSet<TypeId>,
     // Some other accounting data
 }
 
@@ -163,7 +155,7 @@ enum TaskParam {
     Io(IoId, Ready),
     Timeout(TimeoutId),
     Signal(i8),
-    Wakeup(Option<Box<Any>>),
+    Message(Message),
     Idle,
 }
 
@@ -468,6 +460,38 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             Ok(())
         }
     }
+    fn msg_type_check(&self, handle: Handle, tid: &TypeId) -> Result<()> {
+        if !self.event_alive(handle) {
+            return Err(Error::Missing);
+        }
+        if !self.events[handle.id].expected_messages.contains(tid) {
+            Err(Error::MsgUnexpected)
+        } else {
+            Ok(())
+        }
+    }
+    fn send_impl<T: Any + 'static>(&mut self, from: Option<Handle>, handle: Handle, data: T) -> Result<()> {
+        let t = TypeId::of::<T>();
+        self.msg_type_check(handle, &t)?;
+        self.scheduled.push_back(Task {
+            recipient: handle,
+            param: TaskParam::Message(Message {
+                data: Box::new(data),
+                real_type: t,
+                mode: DeliveryMode::Send(from),
+            }),
+        });
+        Ok(())
+    }
+    fn post_impl<T: Any + 'static>(&mut self, from: Option<Handle>, handle: Handle, data: T) -> Result<()> {
+        let t = TypeId::of::<T>();
+        self.msg_type_check(handle, &t)?;
+        self.event_call(handle, |event, context| event.message(context, Message {
+            data: Box::new(data),
+            real_type: t,
+            mode: DeliveryMode::Post(from),
+        }))
+    }
 }
 
 impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {
@@ -481,6 +505,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
             generation: generation,
             timeouts: 0,
             ios: HashMap::new(),
+            expected_messages: HashSet::new(),
         });
         // Generate a handle for it
         let handle = Handle {
@@ -522,8 +547,8 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                         self.event_call(task.recipient, |event, context| event.timeout(context, id))
                     },
                     TaskParam::Signal(_signal) => unimplemented!(),
-                    TaskParam::Wakeup(_data) => unimplemented!(),
                     TaskParam::Idle => self.event_call(task.recipient, |event, context| event.idle(context)),
+                    TaskParam::Message(message) => self.event_call(task.recipient, |event, context| event.message(context, message)),
                 }
             }
         }
@@ -560,13 +585,13 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
     }
     fn event_count(&self) -> usize { self.events.len() }
     fn now(&self) -> &Instant { &self.now }
-    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> {
-        unimplemented!();
+    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.send_impl(None, handle, data)
     }
-    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> {
-        unimplemented!();
+    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.post_impl(None, handle, data)
     }
-    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>> {
+    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>> {
         unimplemented!();
     }
 }
@@ -598,9 +623,13 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'
     fn event_alive(&self, handle: Handle) -> bool { self.event_loop.event_alive(handle) }
     fn event_count(&self) -> usize { self.event_loop.event_count() }
     fn now(&self) -> &Instant { self.event_loop.now() }
-    fn send<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> { self.event_loop.send(handle, data) }
-    fn post<T: Any>(&mut self, handle: Handle, data: T) -> Result<()> { self.event_loop.post(handle, data) }
-    fn channel<T: Any + Send>(&mut self, handle: Handle) -> Result<Channel<T>> { self.event_loop.channel(handle) }
+    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.event_loop.send_impl(Some(self.handle), handle, data)
+    }
+    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.event_loop.post_impl(Some(self.handle), handle, data)
+    }
+    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>> { self.event_loop.channel(handle) }
 }
 
 impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -648,13 +677,13 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
     fn idle(&mut self) {
         self.event_loop.want_idle.insert(self.handle, ());
     }
-    fn expect_message<T: Any>(&mut self) {
+    fn expect_message<T: Any + 'static>(&mut self) {
+        self.event_loop.events[self.handle.id].expected_messages.insert(TypeId::of::<T>());
+    }
+    fn background<R: Any + 'static + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
         unimplemented!();
     }
-    fn background<R: Any + Send, F: Send + FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
-        unimplemented!();
-    }
-    fn fork_task<R: Any, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
+    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(f: F) -> Result<BackgroundId> {
         unimplemented!();
     }
 }
@@ -670,6 +699,7 @@ mod tests {
     use std::time::Duration;
     use std::net::{IpAddr,Ipv4Addr,SocketAddr};
     use std::io::Write;
+    use std::any::TypeId;
 
     struct InitAndContextEvent(Rc<Cell<bool>>);
 
@@ -715,39 +745,79 @@ mod tests {
         assert_eq!(0, l.event_count());
     }
 
-    /* XXX
-    struct Recipient;
-
-    impl<C> Event<C> for Recipient {
-        fn init<S>(&mut self, _scope: &mut S) -> Response {
-            // Stay alive for now
-            Ok(true)
-        }
-    }
-
-    // Terminate when getting ()
-    impl<C> Postable<C, ()> for Recipient {
-        fn deliver<S>(&mut self, _scope: &mut S, _data: ()) -> Response {
-            // Give up after receiving anything
-            Ok(false)
-        }
-    }
-    */
-
     macro_rules! err {
         ($result:expr, $err: pat) => (assert!(match $result { Err($err) => true, _ => false }))
     }
 
-    /*
-    /**
-     * Test we can post to an event.
-     */
+    struct Recurse;
+    struct Recipient;
+    struct SendB(bool);
+
+    impl<C> Event<C, Recipient> for Recipient {
+        fn init<S: Scope<C, Recipient>>(&mut self, scope: &mut S) -> Response {
+            scope.expect_message::<()>();
+            scope.expect_message::<Recurse>();
+            scope.expect_message::<SendB>();
+            // Stay alive for now
+            Ok(true)
+        }
+
+        fn message<S: Scope<C, Recipient>>(&mut self, scope: &mut S, msg: Message) -> Response {
+            let handle = scope.handle();
+            if *msg.real_type() == TypeId::of::<()>() {
+                Ok(false)
+            } else if *msg.real_type() == TypeId::of::<Recurse>() {
+                scope.post(handle, msg.get::<Recurse>()?)?;
+                Ok(true)
+            } else if *msg.real_type() == TypeId::of::<SendB>() {
+                let from = match *msg.mode() {
+                    DeliveryMode::Send(from) => from,
+                    _ => unreachable!(),
+                };
+                let SendB(value) = msg.get::<SendB>()?;
+                if value {
+                    // Sending works even recursively
+                    scope.send(handle, SendB(false))?;
+                    assert!(from.is_none());
+                    Ok(true)
+                } else {
+                    assert_eq!(handle, from.unwrap());
+                    Ok(false)
+                }
+            } else {
+                unreachable!();
+            }
+        }
+    }
+
+    /// Test sending.
+    #[test]
+    fn send() {
+        let mut l: Loop<(), Recipient> = Loop::new(()).unwrap();
+        let handle = l.insert(Recipient).unwrap();
+        err!(l.send(handle, 42), Error::MsgUnexpected);
+        l.send(handle, SendB(true)).unwrap();
+        // It'll die, but sending works only when running ‒ nothing delivered yet
+        assert!(l.event_alive(handle));
+        l.run_until_complete(handle).unwrap();
+        // It ended by now (because it got the message from itself, sent after receiving ours)
+        assert!(!l.event_alive(handle));
+        // Can't send any more
+        err!(l.send(handle, ()), Error::Missing);
+        // Errors from sending are not propagated to the send() call, but to the loop
+        let handle = l.insert(Recipient).unwrap();
+        l.send(handle, Recurse).unwrap();
+        err!(l.run_until_complete(handle), Error::Busy);
+    }
+
+    /// Test we can post to an event.
     #[test]
     fn post() {
         // Create an event that stays there, at least for a while
         let mut l: Loop<(), Recipient> = Loop::new(()).unwrap();
         let handle = l.insert(Recipient).unwrap();
         assert!(l.event_alive(handle));
+        err!(l.post(handle, 42), Error::MsgUnexpected);
         // Post something to it (successfully)
         l.post(handle, ()).unwrap();
         // But it received it and went away
@@ -756,19 +826,7 @@ mod tests {
         err!(l.post(handle, ()), Error::Missing);
     }
 
-    struct Recurse;
-    // Recurse to self
-    impl<C> Postable<C, Recurse> for Recipient {
-        fn deliver<S: Scope<C, Recipient> + EvAccess<C, Self>>(&mut self, scope: &mut S, data: Recurse) -> Response {
-            let handle = scope.handle();
-            scope.post(handle, data)?;
-            Ok(true)
-        }
-    }
-
-    /**
-     * Test we detect busy/recursive post access to an event.
-     */
+    /// Test we detect busy/recursive post access to an event.
     #[test]
     fn busy_post() {
         // Create an event that stays there
@@ -783,7 +841,6 @@ mod tests {
          */
         assert!(!l.event_alive(handle));
     }
-    */
 
     // An event that terminates after given amount of milliseconds
     struct Timeouter {
@@ -808,6 +865,7 @@ mod tests {
         }
     }
 
+    /// Test receiving timeouts
     #[test]
     fn timeout() {
         let mut l: Loop<(), Timeouter> = Loop::new(()).unwrap();
@@ -856,6 +914,7 @@ mod tests {
         // The timeout is not implemented, so the default returns an error
     }
 
+    /// Test explicit error handling in the loop.
     #[test]
     fn error_handler() {
         let mut l: Loop<(), ErrorTimeout> = Loop::new(()).unwrap();
@@ -910,6 +969,7 @@ mod tests {
         }
     }
 
+    /// Test notification about IO readiness
     #[test]
     fn io() {
         let mut l: Loop<Option<SocketAddr>, Listener> = Loop::new(None).unwrap();
@@ -940,6 +1000,7 @@ mod tests {
         // The timeout is not implemented and would fail
     }
 
+    /// Test running tasks when the loop is idle
     #[test]
     fn idle() {
         /*
