@@ -369,13 +369,65 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             }
         })
     }
+    /// Gather the IO-based tasks (IOs and others we got notified by IO thing)
+    fn tasks_gather_io(&mut self) -> Result<()> {
+        for ev in self.mio_events.iter() {
+            let Token(mut idx) = ev.token();
+            if idx >= TOKEN_SHIFT {
+                idx -= TOKEN_SHIFT;
+                /*
+                 * We should not get any invalid events or IOs now, we didn't fire any events
+                 * yet
+                 */
+                self.scheduled.push_back(Task {
+                    recipient: self.ios[idx],
+                    param: TaskParam::Io(IoId { token: ev.token() }, ev.kind()),
+                });
+            } else {
+                // For now, we don't have the special FDs yet
+                unreachable!();
+            }
+        }
+        Ok(())
+    }
+    /// Kill the timers for dead events if there are too many of them
+    fn timers_cleanup(&mut self) {
+        /*
+         * If there are too many dead timeouts, clean them up.
+         * Have some limit for low amount of events, where we don't bother.
+         */
+        // Compute more useful stats than we have
+        let handled = self.timeouts_inserted - self.timeouts.len();
+        let handled_dead = handled - self.timeouts_fired;
+        let still_dead = self.timeouts_dead - handled_dead;
+        let still_alive = self.timeouts.len() - still_dead;
+        // Reset the stats
+        self.timeouts_dead = still_dead;
+        self.timeouts_fired = 0;
+        self.timeouts_inserted = self.timeouts.len();
+        // Check for too many dead ones in the storage
+        if still_dead > 5 && still_alive * 3 < still_dead {
+            let old = replace(&mut self.timeouts, BinaryHeap::new());
+            let pruned: BinaryHeap<TimeoutHolder> = old.into_iter().filter(|ref t| self.event_alive(t.recipient)).collect();
+            self.timeouts = pruned;
+            self.timeouts_dead = 0;
+            self.timeouts_inserted = self.timeouts.len();
+        }
+    }
+    /// Take the timers that are due and put them to the scheduled queue
+    fn tasks_gather_timers(&mut self) -> Result<()> {
+        while self.timeouts.peek().map_or(false, |t| t.when <= self.now) {
+            // This must be Some(...), because of the condition above
+            let timeout = self.timeouts.pop().unwrap();
+            self.scheduled.push_back(Task {
+                recipient: timeout.recipient,
+                param: TaskParam::Timeout(timeout.id),
+            })
+        }
+        Ok(())
+    }
     /**
-     * Gather some tasks. They get added in priority (eg. if there are some IO tasks, no timeouts
-     * are added to the queue):
-     *
-     * * IO tasks, signals, Wakeups
-     * * Timeouts
-     * * Idle tasks
+     * Gather some tasks (expect there are none scheduled now).
      *
      * It is possible this produces no tasks.
      */
@@ -394,72 +446,30 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         // We slept a while, update the now cache
         self.now = Instant::now();
 
-        if self.mio_events.is_empty() {
-            /*
-             * If there are too many dead timeouts, clean them up.
-             * Have some limit for low amount of events, where we don't bother.
-             */
-            let handled = self.timeouts_inserted - self.timeouts.len();
-            let handled_dead = handled - self.timeouts_fired;
-            let still_dead = self.timeouts_dead - handled_dead;
-            let still_alive = self.timeouts.len() - still_dead;
-            // Reset the stats
-            self.timeouts_dead = still_dead;
-            self.timeouts_fired = 0;
-            self.timeouts_inserted = self.timeouts.len();
-            // Check for too many dead ones in the storage
-            if still_dead > 5 && still_alive * 3 < still_dead {
-                let old = replace(&mut self.timeouts, BinaryHeap::new());
-                let pruned: BinaryHeap<TimeoutHolder> = old.into_iter().filter(|ref t| self.event_alive(t.recipient)).collect();
-                self.timeouts = pruned;
-                self.timeouts_dead = 0;
-                self.timeouts_inserted = self.timeouts.len();
-            }
+        // The IO tasks and tasks brought in by special IO things
+        self.tasks_gather_io()?;
 
-            while self.timeouts.peek().map_or(false, |t| t.when <= self.now) {
-                // This must be Some(...), because of the condition above
-                let timeout = self.timeouts.pop().unwrap();
+        // Clean up the timer storage, if needed
+        self.timers_cleanup();
+        // Go and grab our timers
+        self.tasks_gather_timers()?;
+
+        /*
+         * If there were no timeouts, add one idle task (we don't want to put too many there,
+         * so we don't block the loop for too long.
+         */
+        if self.scheduled.is_empty() {
+            if let Some((handle, _)) = self.want_idle.pop_front() {
                 self.scheduled.push_back(Task {
-                    recipient: timeout.recipient,
-                    param: TaskParam::Timeout(timeout.id),
-                })
+                    recipient: handle,
+                    param: TaskParam::Idle,
+                });
             }
-
-            /*
-             * If there were no timeouts, add one idle task (we don't want to put too many there,
-             * so we don't block the loop for too long.
-             */
-            if self.scheduled.is_empty() {
-                if let Some((handle, _)) = self.want_idle.pop_front() {
-                    self.scheduled.push_back(Task {
-                        recipient: handle,
-                        param: TaskParam::Idle,
-                    });
-                }
-            }
-            Ok(())
-            // TODO: If none added, look for idle tasks
-        } else {
-            for ev in self.mio_events.iter() {
-                let Token(mut idx) = ev.token();
-                if idx >= TOKEN_SHIFT {
-                    idx -= TOKEN_SHIFT;
-                    /*
-                     * We should not get any invalid events or IOs now, we didn't fire any events
-                     * yet
-                     */
-                    self.scheduled.push_back(Task {
-                        recipient: self.ios[idx],
-                        param: TaskParam::Io(IoId { token: ev.token() }, ev.kind()),
-                    });
-                } else {
-                    // For now, we don't have the special FDs yet
-                    unreachable!();
-                }
-            }
-            Ok(())
         }
+
+        Ok(())
     }
+    /// Check the given event exists and is willing to accept this kind of message
     fn msg_type_check(&self, handle: Handle, tid: &TypeId) -> Result<()> {
         if !self.event_alive(handle) {
             return Err(Error::Missing);
