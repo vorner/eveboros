@@ -6,8 +6,11 @@ use self::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
 use mio::channel::{Receiver,Sender,channel,SendError};
+use mio::unix::EventedFd;
 use linked_hash_map::LinkedHashMap;
 use threadpool::ThreadPool;
+use nix::sys::signal::{SigSet,Signal};
+use nix::sys::signalfd::{SignalFd,SFD_CLOEXEC,SFD_NONBLOCK};
 use std::num::Wrapping;
 use std::any::Any;
 use std::collections::{VecDeque,BinaryHeap,HashSet,HashMap};
@@ -18,6 +21,7 @@ use std::mem::replace;
 use std::convert::From;
 use std::any::TypeId;
 use std::sync::mpsc::TryRecvError;
+use std::os::unix::io::AsRawFd;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
 pub struct IoId(Token);
@@ -109,8 +113,19 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()>;
     fn io_remove(&mut self, id: IoId) -> Result<()>;
     fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R>;
+    /**
+     * Show interest in receiving these types of signals.
+     *
+     * This also automatically enables the loop's handling of this signal.
+     */
+    fn signal(&mut self, signal: Signal) -> Result<()>;
     fn idle(&mut self);
-    // Say these messages are Ok
+    /**
+     * Allow receiving of messages of the given type.
+     *
+     * Note that you don't have to do this to receive results from background tasks, they get
+     * allowed automatically.
+     */
     fn expect_message<T: Any>(&mut self);
     /**
      * Run a task in the background, in another thread.
@@ -119,6 +134,15 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      * result will get send through the `message` callback, with a `DeliveryMode` `Background`. You
      * don't have to register the return type to receive it (and submitting a task with some return
      * type doesn't register it for the ordinary messages).
+     *
+     * # Note
+     *
+     * While the `f` function returns `Result<R>`, once the result is delivered, you should
+     * `message.get::<R>()` only, as that already returns `Result<R>` (the errors of the function
+     * are squashed together with the errors from `get`tting the result.
+     *
+     * As the type can't be deduced from the parameters, you have to call it as
+     * `scope.expect_message::<i32>()` (or with any other type you want).
      */
     fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
     /**
@@ -129,6 +153,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     // TODO: Only on unix?
     // TODO: Trait for serializing and deserializing?
     fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
+    // TODO: Iterator-based ones as well?
 }
 
 pub type Response = Result<bool>;
@@ -154,7 +179,7 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
     fn init<S: Scope<Context, ScopeEvent>>(&mut self, scope: &mut S) -> Response;
     fn io<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response { Err(Error::DefaultImpl) }
     fn timeout<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response { Err(Error::DefaultImpl) }
-    fn signal<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _signal: i8) -> Response { Err(Error::DefaultImpl) }
+    fn signal<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _signal: Signal) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     fn message<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _msg: Message) -> Response { Err(Error::DefaultImpl) }
 }
@@ -174,7 +199,7 @@ struct EvHolder<Event> {
 enum TaskParam {
     Io(IoId, Ready),
     Timeout(TimeoutId),
-    Signal(i8),
+    Signal(Signal),
     Message(Message),
     Idle,
 }
@@ -222,8 +247,9 @@ impl<E: Evented + 'static> IoHolderAny for IoHolder<E> {
     fn as_any_mut(&mut self) -> &mut Any { self }
 }
 
-const TOKEN_SHIFT: usize = 1;
+const TOKEN_SHIFT: usize = 2;
 const CHANNEL_TOK: Token = Token(0);
+const SIGNAL_TOK: Token = Token(1);
 
 struct BackgroundWrapper<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>> {
     requestor: Handle,
@@ -297,6 +323,10 @@ pub struct Loop<Context, Ev> {
     receiver: Receiver<Task>,
     threadpool: Option<ThreadPool>,
     background_generation: Wrapping<u64>,
+    // Signal handling
+    signal_mask: SigSet,
+    signal_fd: SignalFd,
+    signal_recipients: HashMap<i32, HashSet<Handle>>,
 }
 
 impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
@@ -309,6 +339,9 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         let (sender, receiver) = channel();
         let poll = Poll::new()?;
         poll.register(&receiver, CHANNEL_TOK, Ready::readable(), PollOpt::empty())?;
+        let signal_mask = SigSet::empty();
+        let signal_fd = SignalFd::with_flags(&signal_mask, SFD_CLOEXEC | SFD_NONBLOCK)?;
+        poll.register(&EventedFd(&signal_fd.as_raw_fd()), SIGNAL_TOK, Ready::readable(), PollOpt::empty())?;
         Ok(Loop {
             poll: poll,
             mio_events: Events::with_capacity(1024),
@@ -331,12 +364,14 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             receiver: receiver,
             threadpool: None,
             background_generation: Wrapping(0),
+            signal_mask: signal_mask,
+            signal_fd: signal_fd,
+            signal_recipients: HashMap::new(),
         })
     }
     pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
     /// Kill an event at given index.
     fn event_kill(&mut self, idx: usize) -> Option<Ev> {
-        // TODO: Some other handling, like killing its IOs, timers, etc
         let event = self.events.release(idx);
         // These timeouts are dead now
         self.timeouts_dead += event.timeouts;
@@ -345,7 +380,15 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             self.poll.deregister(v.io()).unwrap(); // Must not fail, this one is valid
             self.ios_released.insert(k);
         }
-        self.want_idle.remove(&Handle { id: idx, generation: event.generation });
+        let handle = Handle { id: idx, generation: event.generation };
+        self.want_idle.remove(&handle);
+        /*
+         * There are only few signals, go through them all instead of building some fancy
+         * back-linking
+         */
+        for sig_recpt in self.signal_recipients.values_mut() {
+            sig_recpt.remove(&handle);
+        }
         event.event
     }
     // Run function on an event, with the scope and result checking
@@ -445,6 +488,29 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
                         }
                     }
                 },
+                SIGNAL_TOK => {
+                    loop {
+                        match self.signal_fd.read_signal() {
+                            Ok(None) => break, // No more signals for now, return later
+                            Ok(Some(siginfo)) => {
+                                /*
+                                 * Convert there and back ‒ it is not really guaranteed the
+                                 * from_c_int doesn't do any fancy conversion.
+                                 */
+                                let signal = Signal::from_c_int(siginfo.ssi_signo as i32)?;
+                                let signum = signal as i32;
+                                // TODO: Special case SIGCHLD
+                                if let Some(ref recipients) = self.signal_recipients.get(&signum) {
+                                    self.scheduled.extend(recipients.iter().map(|handle| Task {
+                                        recipient: handle.clone(),
+                                        param: TaskParam::Signal(signal)
+                                    }));
+                                }
+                            },
+                            Err(e) => return Err(Error::Nix(e)),
+                        }
+                    }
+                }
                 Token(mut idx) => {
                     assert!(idx >= TOKEN_SHIFT);
                     idx -= TOKEN_SHIFT;
@@ -579,6 +645,75 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             Some(ref mut pool) => pool.set_num_threads(cnt),
         }
     }
+    /**
+     * Let the loop handle the given signal (in addition to any others it already handles).
+     *
+     * This will let the event loop take care of the given signal. The signal is masked from the
+     * normal signal handlers in this thread and it is registered within the loop. It can then be
+     * handled by events registering for the signal.
+     *
+     * If more than one event registers for the signal, it is broadcasted between them. Similarly,
+     * if no event wants it, the signal is lost.
+     *
+     * Calling this when the signal is already enabled in this event loop is a no-op. Enabling it
+     * in multiple loops for process-level signals may have undesirable effects (the first one to
+     * ask for it gets the signal).
+     *
+     * The first event that asks for the signal automatically triggers enabling of the signal.
+     *
+     * # Notes
+     *
+     * Signals get merged when multiple same ones arrive before they get handled. Therefore,
+     * receiving the signal means that *at least one* was sent, but there may have been more.
+     *
+     * For the signal handling to work, the given signal must be masked in all threads for
+     * process-level signals (most of the useful ones are process-level ones). As the mask is
+     * inherited from creating thread, creating the loop first before starting any threads and
+     * calling this or registering events that use signals is one way to accomplish that. Note that
+     * this also includes the background threads in the loop's thread-pool, which are created once
+     * you either set the number of threads or the first background job is submitted.
+     *
+     * SIGCHLD is handled specially by the loop. But you can enable it this way for the above
+     * reasons.
+     *
+     * The original mask is *not* restored on the loop destruction.
+     */
+    pub fn signal_enable(&mut self, signal: Signal) -> Result<()> {
+        if self.signal_mask.contains(signal) {
+            // Already registered, do nothing
+            return Ok(());
+        }
+        self.signal_mask.add(signal);
+        self.signal_mask.thread_block()?;
+        self.signal_fd.set_mask(&self.signal_mask)?;
+        Ok(())
+    }
+    /**
+     * Disable receiving of the given signal and unmask it from this process.
+     *
+     * This does not unregister the events that registered for the signal. They just don't get the
+     * signal notification any more.
+     *
+     * # Notes
+     *
+     * Note that any event may register for the signal later on, which would re-enable the signal
+     * handling.
+     *
+     * Other threads may not get the signals re-enabled automatically (but newly started threads
+     * inherit the current mask).
+     */
+    pub fn signal_disable(&mut self, signal: Signal) -> Result<()> {
+        if !self.signal_mask.contains(signal) {
+            // Not there, nothing to disable
+            return Ok(());
+        }
+        self.signal_mask.remove(signal);
+        self.signal_fd.set_mask(&self.signal_mask)?;
+        let mut unmask = SigSet::empty();
+        unmask.add(signal);
+        unmask.thread_unblock()?;
+        Ok(())
+    }
 }
 
 impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {
@@ -633,7 +768,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                         self.events[task.recipient.id].timeouts -= 1;
                         self.event_call(task.recipient, |event, context| event.timeout(context, id))
                     },
-                    TaskParam::Signal(_signal) => unimplemented!(),
+                    TaskParam::Signal(signal) => self.event_call(task.recipient, |event, context| event.signal(context, signal)),
                     TaskParam::Idle => self.event_call(task.recipient, |event, context| event.idle(context)),
                     TaskParam::Message(message) => self.event_call(task.recipient, |event, context| event.message(context, message)),
                 }
@@ -805,6 +940,12 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
     fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId> {
         unimplemented!();
     }
+    fn signal(&mut self, signal: Signal) -> Result<()> {
+        self.event_loop.signal_enable(signal)?;
+        let signum = signal as i32;
+        self.event_loop.signal_recipients.entry(signum).or_insert(HashSet::new()).insert(self.handle);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -813,6 +954,7 @@ mod tests {
     use ::error::*;
     use mio::tcp::{TcpListener,TcpStream};
     use mio::{Ready,PollOpt};
+    use nix::sys::signal::{Signal,raise};
     use std::rc::Rc;
     use std::cell::Cell;
     use std::time::Duration;
@@ -1212,5 +1354,39 @@ mod tests {
         let mut l: Loop<(), Idle> = Loop::new(()).unwrap();
         l.insert(Idle).unwrap();
         l.run().unwrap();
+    }
+
+    /// Thing that terminates once the correct signal is received
+    struct SigRecipient(Signal);
+
+    impl Event<(), SigRecipient> for SigRecipient {
+        fn init<S: Scope<(), SigRecipient>>(&mut self, scope: &mut S) -> Response {
+            scope.signal(self.0).map(|_| true)
+        }
+        fn signal<S: Scope<(), SigRecipient>>(&mut self, _scope: &mut S, signal: Signal) -> Response {
+            assert_eq!(self.0, signal);
+            Ok(false)
+        }
+    }
+
+    /// Test signal delivery to events
+    #[test]
+    fn signal() {
+        let mut l: Loop<(), SigRecipient> = Loop::new(()).unwrap();
+        // Push bunch of signal recipients in
+        let handle = l.insert(SigRecipient(Signal::SIGUSR1)).unwrap();
+        for _ in 0..10 {
+            l.insert(SigRecipient(Signal::SIGUSR2)).unwrap();
+        }
+        assert_eq!(11, l.event_count());
+        // Sending SIGUSR2 will stop all the corresponding tasks
+        raise(Signal::SIGUSR2).unwrap();
+        while l.event_count() > 1 {
+            l.run_one().unwrap();
+        }
+        // But the SIGUSR1 still stays
+        assert!(l.event_alive(handle));
+        raise(Signal::SIGUSR1).unwrap();
+        l.run_until_complete(handle).unwrap();
     }
 }

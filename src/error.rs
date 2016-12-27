@@ -1,11 +1,14 @@
 use std::convert::From;
 use std::io;
+use nix;
 
 /// A EveBoros error.
 #[derive(Debug)]
 pub enum Error {
     /// An embedded IO error from some low-level operation
     Io(io::Error),
+    /// An embedded nix error
+    Nix(nix::Error),
     /**
      * The default implementation called
      *
@@ -42,6 +45,12 @@ pub enum Error {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
+    }
+}
+
+impl From<nix::Error> for Error {
+    fn from(e: nix::Error) -> Self {
+        Error::Nix(e)
     }
 }
 

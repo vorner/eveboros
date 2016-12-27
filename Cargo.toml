@@ -7,3 +7,7 @@ authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
 mio = "0.6"
 linked-hash-map = "0.3"
 threadpool = "1.0"
+
+[dependencies.nix]
+version = "0.7"
+features = ["signalfd"]
