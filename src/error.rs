@@ -38,6 +38,8 @@ pub enum Error {
     LoopGone,
     /// The background task panicked
     BackgroundPanicked,
+    /// An end of background iterator (not really an error, kind of expected to happen)
+    IterEnd,
 }
 
 // TODO: Implement the error trait

@@ -153,6 +153,14 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      */
     fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
     /**
+     * This is similar to `background`, but produces multiple results instead of one.
+     *
+     * It acts in a similar way to `background`. However, once the task is run, it produces an
+     * iterator. The background thread sends one `R` for each item received from the iterator (as a
+     * separate message). It then terminates the sequence by Err(Error::IterEnd).
+     */
+    fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId>;
+    /**
      * Run a task in a forked subprocess. The task result gets serialized and deserialized here.
      *
      * Otherwise it has similar behaviour than `background`.
@@ -161,6 +169,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
     // TODO: Trait for serializing and deserializing?
     fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
     // TODO: Iterator-based ones as well?
+    fn fork_task_iter<R: Any + 'static, I: Iterator<Item = R>, F: FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId>;
 }
 
 pub type Response = Result<bool>;
@@ -258,19 +267,20 @@ const TOKEN_SHIFT: usize = 2;
 const CHANNEL_TOK: Token = Token(0);
 const SIGNAL_TOK: Token = Token(1);
 
-struct BackgroundWrapper<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>> {
+struct BackgroundWrapper<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: Any + 'static + Send> {
     requestor: Handle,
     id: BackgroundId,
     complete: bool,
     sender: Sender<RemoteMessage>,
     task: Option<F>,
+    _final: PhantomData<FinalR>,
 }
 
 /*
  * A trick. This gets called even whn we panic. So, we send a message it panicked in case it isn't
  * complete yet.
  */
-impl<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>> Drop for BackgroundWrapper<R, F> {
+impl<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: Any + 'static + Send> Drop for BackgroundWrapper<R, F, FinalR> {
     fn drop(&mut self) {
         if !self.complete {
             /*
@@ -279,8 +289,8 @@ impl<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>> Drop fo
              */
             let _ = self.sender.send(RemoteMessage {
                 recipient: self.requestor,
-                data: Box::new(Err(Error::BackgroundPanicked) as Result<R>),
-                real_type: TypeId::of::<Result<R>>(),
+                data: Box::new(Err(Error::BackgroundPanicked) as Result<FinalR>),
+                real_type: TypeId::of::<Result<FinalR>>(),
                 mode: DeliveryMode::Background(self.id),
             });
         }
@@ -851,6 +861,21 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopScope<'a, Loop<Context, Ev>> {
             Err(Error::MissingIo)
         }
     }
+    fn background_task<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: 'static + Send + Any>(&mut self, f: F) -> (BackgroundId, BackgroundWrapper<R, F, FinalR>) {
+        if self.event_loop.threadpool.is_none() {
+            self.event_loop.pool_thread_count_set(1);
+        }
+        let id = BackgroundId(self.event_loop.background_generation.0);
+        self.event_loop.background_generation += Wrapping(1);
+        (id, BackgroundWrapper {
+            requestor: self.handle,
+            id: id,
+            complete: false,
+            sender: self.event_loop.sender.clone(),
+            task: Some(f),
+            _final: PhantomData,
+        })
+    }
 }
 
 impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -921,22 +946,9 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
         self.event_loop.events[self.handle.id].expected_messages.insert(TypeId::of::<T>());
     }
     fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId> {
-        if self.event_loop.threadpool.is_none() {
-            self.event_loop.pool_thread_count_set(1);
-        }
-        let id = BackgroundId(self.event_loop.background_generation.0);
-        let mut task = BackgroundWrapper {
-            requestor: self.handle,
-            id: id,
-            complete: false,
-            sender: self.event_loop.sender.clone(),
-            task: Some(f),
-        };
-        self.event_loop.background_generation += Wrapping(1);
+        let (id, mut task) = self.background_task::<R, F, R>(f);
         self.event_loop.threadpool.as_mut().unwrap().execute(move || {
             let result = (task.task.take().unwrap())();
-            // Good, completed without panic. Disarm the Drop trait there.
-            task.complete = true;
             // And send the result (ignore if there's no recipient, then we're just done).
             let _ = task.sender.send(RemoteMessage {
                 recipient: task.requestor,
@@ -944,10 +956,43 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
                 real_type: TypeId::of::<Result<R>>(),
                 mode: DeliveryMode::Background(task.id),
             });
+            // Good, completed without panic. Disarm the Drop trait there.
+            task.complete = true;
         });
         Ok(id)
     }
-    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId> {
+    fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId> {
+        let (id, mut task) = self.background_task::<I, F, R>(f);
+        self.event_loop.threadpool.as_mut().unwrap().execute(move || {
+            let fun = task.task.take().unwrap();
+            let result = fun();
+            { // Block, so send gets destroyed soon enough
+                let send = |value: Result<R>| {
+                    let _ = task.sender.send(RemoteMessage {
+                        recipient: task.requestor,
+                        data: Box::new(value),
+                        real_type: TypeId::of::<Result<R>>(),
+                        mode: DeliveryMode::Background(task.id),
+                    });
+                };
+                match result {
+                    Ok(iter) => {
+                        for val in iter {
+                            send(Ok(val));
+                        }
+                        send(Err(Error::IterEnd));
+                    },
+                    Err(err) => send(Err(err)),
+                }
+            }
+            task.complete = true;
+        });
+        Ok(id)
+    }
+    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, _f: F) -> Result<BackgroundId> {
+        unimplemented!();
+    }
+    fn fork_task_iter<R: Any + 'static, I: Iterator<Item = R>, F: FnOnce() -> Result<I>>(&mut self, _f: F) -> Result<BackgroundId> {
         unimplemented!();
     }
     fn signal(&mut self, signal: Signal) -> Result<()> {
@@ -1150,13 +1195,15 @@ mod tests {
     struct BackReceiver {
         answer: Option<BackgroundId>,
         broken: Option<BackgroundId>,
+        iter: Option<BackgroundId>,
         received: usize,
     }
 
     impl Event<(), BackReceiver> for BackReceiver {
         fn init<S: Scope<(), BackReceiver>>(&mut self, scope: &mut S) -> Response {
-            self.broken = Some(scope.background(move || -> Result<()> { panic!("Testing handling of panic") }).unwrap());
-            self.answer = Some(scope.background(move || Ok(42u8)).unwrap());
+            self.broken = Some(scope.background(move || -> Result<()> { panic!("Testing handling of panic") })?);
+            self.answer = Some(scope.background(move || Ok(42u8))?);
+            self.iter = Some(scope.background_iter(move || Ok(vec![(), (), ()].into_iter()))?);
             Ok(true)
         }
         fn message<S: Scope<(), BackReceiver>>(&mut self, _scope: &mut S, message: Message) -> Response {
@@ -1171,11 +1218,17 @@ mod tests {
             } else if Some(id) == self.broken {
                 err!(message.get::<()>(), Error::BackgroundPanicked);
                 self.broken.take();
+            } else if Some(id) == self.iter {
+                match message.get::<()>() {
+                    Err(Error::IterEnd) => { self.iter.take(); },
+                    Err(e) => return Err(e),
+                    Ok(()) => (),
+                };
             } else {
                 unreachable!();
             }
-            // Stop after receiving both background tasks
-            Ok(self.received < 2)
+            // Stop after receiving all background tasks (the iter is triggered multiple times)
+            Ok(self.received < 6)
         }
     }
 
@@ -1189,6 +1242,7 @@ mod tests {
             l.insert(BackReceiver {
                 answer: None,
                 broken: None,
+                iter: None,
                 received: 0,
             }).unwrap();
         }
