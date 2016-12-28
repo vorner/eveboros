@@ -16,7 +16,7 @@ use nix::sys::signal::{raise,Signal};
 use nix::unistd::{ForkResult,fork};
 use libc::pid_t;
 use std::process::exit;
-use std::panic::catch_unwind;
+use std::panic::{catch_unwind,set_hook,take_hook};
 
 /// Thing that terminates once the correct signal is received
 struct SigRecipient(Signal);
@@ -94,8 +94,12 @@ fn child_multiple_test() {
 fn main() {
     signal_test();
     child_test();
+    set_hook(Box::new(|_| ())); // Don't print the info about the panic we want to happen
     match catch_unwind(child_multiple_test) {
-        Ok(_) => panic!("Unexpectedly didn't panic on multiple registration of the same PID"),
+        Ok(_) => {
+            take_hook(); // Allow normal panicking again.
+            panic!("Unexpectedly didn't panic on multiple registration of the same PID");
+        },
         Err(_) => (),
     }
 }
