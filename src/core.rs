@@ -1,8 +1,6 @@
-mod recycler;
-
 // TODO: Some logging
 
-use self::recycler::Recycler;
+use super::recycler::Recycler;
 use error::{Result,Error};
 use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
 use mio::channel::{Receiver,Sender,channel,SendError};
