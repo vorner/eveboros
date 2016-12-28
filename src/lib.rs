@@ -87,8 +87,9 @@ extern crate mio;
 extern crate linked_hash_map;
 extern crate threadpool;
 extern crate nix;
+extern crate libc;
 
 pub mod error;
 mod core;
 
-pub use core::Loop;
+pub use core::{IoId,TimeoutId,Handle,Channel,Message,BackgroundId,Loop,LoopIface,Scope,Event,Response,DeliveryMode,ChildExit};

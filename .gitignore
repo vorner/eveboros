@@ -1,2 +1,4 @@
 target
 Cargo.lock
+# Core files just appear all over the place during normal development O:-)
+core

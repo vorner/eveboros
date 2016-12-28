@@ -11,6 +11,10 @@ use linked_hash_map::LinkedHashMap;
 use threadpool::ThreadPool;
 use nix::sys::signal::{SigSet,Signal};
 use nix::sys::signalfd::{SignalFd,SFD_CLOEXEC,SFD_NONBLOCK};
+use nix::sys::wait::{WaitStatus,waitpid,WNOHANG};
+use nix::Errno;
+use nix;
+use libc::pid_t;
 use std::num::Wrapping;
 use std::any::Any;
 use std::collections::{VecDeque,BinaryHeap,HashSet,HashMap};
@@ -161,15 +165,25 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      */
     fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId>;
     /**
-     * Run a task in a forked subprocess. The task result gets serialized and deserialized here.
+     * Track a child process.
      *
-     * Otherwise it has similar behaviour than `background`.
+     * It is not allowed to track the same child by multiple events. Also, this registers the
+     * SIGCHLD signal into the loop.
+     *
+     * It's not possible to track children not started by this process.
+     *
+     * # Note
+     *
+     * You might want to enable SIGCHLD on the event loop before forking/starting the child to
+     * avoid race conditions (the child terminating sooner than the SIGCHLD is enabled, leading to
+     * missed signal).
+     *
+     * # Panics
+     *
+     * It panics if you try to register the same `pid` multiple times (by either the same or
+     * different events) into the same loop.
      */
-    // TODO: Only on unix?
-    // TODO: Trait for serializing and deserializing?
-    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
-    // TODO: Iterator-based ones as well?
-    fn fork_task_iter<R: Any + 'static, I: Iterator<Item = R>, F: FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId>;
+    fn child(&mut self, pid: pid_t) -> Result<()>;
 }
 
 pub type Response = Result<bool>;
@@ -185,10 +199,17 @@ pub enum DeliveryMode {
     Send(Option<Handle>),
     // Result of a background task
     Background(BackgroundId),
-    // Result sent from forked task
-    Process(BackgroundId),
     // Sent by some (possibly other) thread through a channel
     Remote,
+}
+
+/// How did the child exit?
+#[derive(Debug,Clone,Eq,PartialEq)]
+pub enum ChildExit {
+    /// A normal exit, with the given exit code
+    Exited(i8),
+    /// Dead caused by a signal
+    Signaled(Signal),
 }
 
 pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
@@ -198,6 +219,7 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
     fn signal<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _signal: Signal) -> Response { Err(Error::DefaultImpl) }
     fn idle<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S) -> Response { Err(Error::DefaultImpl) }
     fn message<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _msg: Message) -> Response { Err(Error::DefaultImpl) }
+    fn child<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _pid: pid_t, _exit: ChildExit) -> Response { Err(Error::DefaultImpl) }
 }
 
 struct EvHolder<Event> {
@@ -208,7 +230,8 @@ struct EvHolder<Event> {
     // The IOs belonging to this event
     ios: HashMap<usize, Box<IoHolderAny>>,
     expected_messages: HashSet<TypeId>,
-    // Some other accounting data
+    // The children we want to be informed about
+    children: HashSet<pid_t>,
 }
 
 #[derive(Debug)]
@@ -217,6 +240,7 @@ enum TaskParam {
     Timeout(TimeoutId),
     Signal(Signal),
     Message(Message),
+    Child(pid_t, ChildExit),
     Idle,
 }
 
@@ -342,6 +366,8 @@ pub struct Loop<Context, Ev> {
     signal_mask: SigSet,
     signal_fd: SignalFd,
     signal_recipients: HashMap<i32, HashSet<Handle>>,
+    // Child tracking
+    children: HashMap<pid_t, Handle>,
 }
 
 impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
@@ -382,6 +408,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             signal_mask: signal_mask,
             signal_fd: signal_fd,
             signal_recipients: HashMap::new(),
+            children: HashMap::new(),
         })
     }
     pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
@@ -403,6 +430,9 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
          */
         for sig_recpt in self.signal_recipients.values_mut() {
             sig_recpt.remove(&handle);
+        }
+        for child in event.children.into_iter() {
+            self.children.remove(&child);
         }
         event.event
     }
@@ -490,6 +520,34 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             }
         })
     }
+    /// Gather the dead child processes
+    fn children_gather(scheduled: &mut VecDeque<Task>, children: &mut HashMap<pid_t, Handle>, events: &mut Recycler<EvHolder<Ev>>) -> Result<()> {
+        let mut push = |pid, exit| {
+            if let Some(handle) = children.remove(&pid) {
+                /*
+                 * The event must be alive, otherwise the handle would not be stored there, we
+                 * remove them right away.
+                 */
+                assert!(events[handle.id].children.remove(&pid));
+                scheduled.push_back(Task {
+                    recipient: handle,
+                    param: TaskParam::Child(pid, exit),
+                });
+            }
+            // No event waiting for it → throw it away
+        };
+        loop {
+            // Wait for any PId whatsoever, but don't block.
+            match waitpid(-1, Some(WNOHANG)) {
+                Err(nix::Error::Sys(Errno::EAGAIN)) => return Ok(()), // No more children terminated, done
+                Err(nix::Error::Sys(Errno::ECHILD)) => return Ok(()), // There are no more children at all
+                Err(err) => return Err(Error::Nix(err)), // Propagate other errors
+                Ok(WaitStatus::Exited(pid, code)) => push(pid, ChildExit::Exited(code)),
+                Ok(WaitStatus::Signaled(pid, signal, _)) => push(pid, ChildExit::Signaled(signal)),
+                Ok(_) => (), // Other status changes are not interesting to us
+            }
+        }
+    }
     /// Gather the IO-based tasks (IOs and others we got notified by IO thing)
     fn tasks_gather_io(&mut self) -> Result<()> {
         for ev in self.mio_events.iter() {
@@ -521,7 +579,9 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
                                  */
                                 let signal = Signal::from_c_int(siginfo.ssi_signo as i32)?;
                                 let signum = signal as i32;
-                                // TODO: Special case SIGCHLD
+                                if signal == Signal::SIGCHLD {
+                                    Self::children_gather(&mut self.scheduled, &mut self.children, &mut self.events)?;
+                                }
                                 if let Some(ref recipients) = self.signal_recipients.get(&signum) {
                                     self.scheduled.extend(recipients.iter().map(|handle| Task {
                                         recipient: handle.clone(),
@@ -750,6 +810,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
             timeouts: 0,
             ios: HashMap::new(),
             expected_messages: HashSet::new(),
+            children: HashSet::new(),
         });
         // Generate a handle for it
         let handle = Handle {
@@ -793,6 +854,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                     TaskParam::Signal(signal) => self.event_call(task.recipient, |event, context| event.signal(context, signal)),
                     TaskParam::Idle => self.event_call(task.recipient, |event, context| event.idle(context)),
                     TaskParam::Message(message) => self.event_call(task.recipient, |event, context| event.message(context, message)),
+                    TaskParam::Child(pid, exit) => self.event_call(task.recipient, |event, context| event.child(context, pid, exit)),
                 }
             }
         }
@@ -846,7 +908,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
     }
 }
 
-pub struct LoopScope<'a, Loop: 'a> {
+struct LoopScope<'a, Loop: 'a> {
     event_loop: &'a mut Loop,
     handle: Handle,
 }
@@ -989,16 +1051,17 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
         });
         Ok(id)
     }
-    fn fork_task<R: Any + 'static, F: FnOnce() -> Result<R>>(&mut self, _f: F) -> Result<BackgroundId> {
-        unimplemented!();
-    }
-    fn fork_task_iter<R: Any + 'static, I: Iterator<Item = R>, F: FnOnce() -> Result<I>>(&mut self, _f: F) -> Result<BackgroundId> {
-        unimplemented!();
-    }
     fn signal(&mut self, signal: Signal) -> Result<()> {
         self.event_loop.signal_enable(signal)?;
         let signum = signal as i32;
         self.event_loop.signal_recipients.entry(signum).or_insert(HashSet::new()).insert(self.handle);
+        Ok(())
+    }
+    fn child(&mut self, pid: pid_t) -> Result<()> {
+        self.event_loop.signal_enable(Signal::SIGCHLD)?;
+        assert!(!self.event_loop.children.contains_key(&pid));
+        self.event_loop.children.insert(pid, self.handle);
+        self.event_loop.events[self.handle.id].children.insert(pid);
         Ok(())
     }
 }
@@ -1009,7 +1072,6 @@ mod tests {
     use ::error::*;
     use mio::tcp::{TcpListener,TcpStream};
     use mio::{Ready,PollOpt};
-    use nix::sys::signal::{Signal,raise};
     use std::rc::Rc;
     use std::cell::Cell;
     use std::time::Duration;
@@ -1420,37 +1482,12 @@ mod tests {
         l.run().unwrap();
     }
 
-    /// Thing that terminates once the correct signal is received
-    struct SigRecipient(Signal);
-
-    impl Event<(), SigRecipient> for SigRecipient {
-        fn init<S: Scope<(), SigRecipient>>(&mut self, scope: &mut S) -> Response {
-            scope.signal(self.0).map(|_| true)
-        }
-        fn signal<S: Scope<(), SigRecipient>>(&mut self, _scope: &mut S, signal: Signal) -> Response {
-            assert_eq!(self.0, signal);
-            Ok(false)
-        }
-    }
-
-    /// Test signal delivery to events
-    #[test]
-    fn signal() {
-        let mut l: Loop<(), SigRecipient> = Loop::new(()).unwrap();
-        // Push bunch of signal recipients in
-        let handle = l.insert(SigRecipient(Signal::SIGUSR1)).unwrap();
-        for _ in 0..10 {
-            l.insert(SigRecipient(Signal::SIGUSR2)).unwrap();
-        }
-        assert_eq!(11, l.event_count());
-        // Sending SIGUSR2 will stop all the corresponding tasks
-        raise(Signal::SIGUSR2).unwrap();
-        while l.event_count() > 1 {
-            l.run_one().unwrap();
-        }
-        // But the SIGUSR1 still stays
-        assert!(l.event_alive(handle));
-        raise(Signal::SIGUSR1).unwrap();
-        l.run_until_complete(handle).unwrap();
-    }
+    /*
+     * Note that signal handling is tested in a separate integration test without any harness. We
+     * need to block the signals in all threads, but running tests in parallel and the harness
+     * itself living in a thread we never see simply prevents that.
+     *
+     * It would be great if POSIX offered better way to handle signals when there are threads, but,
+     * well, we have to live with what we have.
+     */
 }

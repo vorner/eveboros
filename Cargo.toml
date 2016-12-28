@@ -3,11 +3,32 @@ name = "eveboros"
 version = "0.1.0"
 authors = ["Michal 'vorner' Vaner <vorner@vorner.cz>"]
 
+[lib]
+name = "eveboros"
+path = "src/lib.rs"
+harness = true
+test = true
+
+[[test]]
+name = "signal-handling"
+path = "tests/signal-handling.rs"
+# We need this thing to run without any test harness, because it interferes
+# with our signal handling
+harness = false
+test = true
+
 [dependencies]
 mio = "0.6"
 linked-hash-map = "0.3"
 threadpool = "1.0"
+libc = "0.2"
 
 [dependencies.nix]
 version = "0.7"
 features = ["signalfd"]
+
+[profile.dev]
+codegen-units = 4
+
+[profile.test]
+codegen-units = 4
