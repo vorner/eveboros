@@ -1,5 +1,5 @@
 /*!
- * EveBoros is a high-level event loop for Rust.
+ * EveBoros is a high-level and flexible event loop for Rust.
  *
  * # Motivation
  *
@@ -12,7 +12,7 @@
  * The others offer sophisticated models which can be used for network server development. These
  * models turn to a hindrance once trying to write something a bit different. For example, none of
  * the others support easy handling of executed subprocesses (which doesn't mean only waiting for
- * them to happen, but interacting with their stdios).
+ * them to terminate, but interacting with their stdios as well).
  *
  * EveBoros goes with the good old callback style. You register for an event and once that event
  * fires, your code gets called. The aim is more on versatility and ease of use than on following
@@ -28,7 +28,8 @@
  * [rotor](https://crates.io/crates/rotor). Its state machines are quite cool. However, the need to
  * use just one kind of a state machine in a given event loop is limiting if you do something more
  * complex than answering one kind of protocol. Splitting the different functionality into
- * different modules is hard, as the machines need to be composed together.
+ * different modules is hard, as the machines need to be composed together. Also, it is hard to
+ * watch multiple event sources from the same state machine.
  *
  * EveBoros allows plugging distinct types of rotor's machines into the loop. It does so at the
  * cost of working with trait objects instead of concrete types.
@@ -52,28 +53,27 @@
  *   - Inter-thread message queues
  *   - Unix signals
  *
+ * Some of these are implemented as abstraction layers or events plugged into the core loop.
+ *
  * # Interface
  *
- * There's one central object, `Loop`. You register for events, each time providing a `Callback`
- * object. The callback object gets its method called whenever the event happens.
+ * There's one central object, [Loop](struct.Event.html). You register for events, each time
+ * providing an [Event](trait.Event.html) object. The event registers interest for some things and
+ * gets its callbacks executed when the thing happens.
  *
- * Upon registration, the ownership of the callback is transfered into a new `Handle` object. The
- * handle object can be cloned (and all of the handles manipulate the same `Callback` and event).
- * The handle allows access to the original callback and allows manipulation with the registration.
- * If you drop the handle (or all of them, if you cloned), then the event is unregistered. If you
- * destroy the loop first, the callbacks are preserved, but won't get called any more.
- *
- * Different kinds of events have their `Callback`s and `Handle`s generic over different parameter
- * types. As the `Callback` is a trait, the library may provide some pre-made kinds (like the
- * futures).
+ * Upon registration, the ownership of the event is transfered into the loop, returning a
+ * [Handle](struct.Handle.html) object. The handle object can be cloned
+ * The handle allows accessing to the original event and allows manipulation with the registration.
  *
  * Furthermore, the loop is recursive. It is allowed to call methods waiting for completion of some
- * events even from callbacks of other events.
+ * events even from callbacks of other events (though there are some rough edges around that, some
+ * things need to be implemented).
  *
  * # Thread safety
  *
- * The loop and the handles are not thread `Send`. This means you need to have a separate event
- * loop per thread, but you are allowed to do whatever you like inside the callbacks.
+ * The loop is not thread safe, you need a different loop in each thread. Furthermore, due to POSIX
+ * limitatitons, it is possible to handle each signal in only one thread. As handling of child
+ * processes containst receiving a SIGCHLD, only one thread can handle child processes.
  *
  * # Status
  *
@@ -81,6 +81,60 @@
  *
  * Also, the way we'll connect to the other code (like creating the scopes for the machines) is a
  * bit in flux.
+ *
+ * # Examples
+ *
+ * ```
+ * extern crate eveboros;
+ * extern crate mio;
+ *
+ * use eveboros::*;
+ * use mio::{Ready,PollOpt};
+ * use mio::tcp::{TcpStream,TcpListener};
+ * use std::io::Write;
+ * use std::time::Duration;
+ * use std::net::{IpAddr,Ipv4Addr,SocketAddr};
+ *
+ * struct WriterWithTimeout;
+ *
+ * impl<AnyEv: From<WriterWithTimeout>> Event<SocketAddr, AnyEv> for WriterWithTimeout {
+ *     fn init<S: Scope<SocketAddr, AnyEv>>(&mut self, scope: &mut S) -> Response {
+ *         let mut t: Option<TcpStream> = None;
+ *         scope.with_context(|context| {
+ *             t = Some(TcpStream::connect(context)?);
+ *             Ok(())
+ *         }).unwrap();
+ *         scope.io_register(t.unwrap(), Ready::writable(), PollOpt::empty())?;
+ *         scope.timeout_after(&Duration::new(10, 0));
+ *         Ok(true)
+ *     }
+ *     fn io<S: Scope<SocketAddr, AnyEv>>(&mut self, scope: &mut S, io: IoId, _ready: Ready) -> Response {
+ *         /*
+ *          * Try sending password.
+ *          */
+ *         scope.with_io(io, |stream: &mut TcpStream| {
+ *             write!(stream, "root\nroot\n").unwrap();
+ *             Ok(())
+ *         }).unwrap();
+ *         // Not really needed, we terminate the event just after this.
+ *         scope.io_remove(io).unwrap();
+ *         // After sending the password, terminate the event.
+ *         Ok(false)
+ *     }
+ *     fn timeout<S: Scope<SocketAddr, AnyEv>>(&mut self, _scope: &mut S, _timeout: TimeoutId) -> Response {
+ *         // Give up after 10 seconds
+ *         Ok(false)
+ *     }
+ * }
+ *
+ * fn main() {
+ *     let listener = TcpListener::bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)).unwrap();
+ *     let mut ev_loop: Loop<SocketAddr, WriterWithTimeout> = Loop::new(listener.local_addr().unwrap()).unwrap();
+ *     let handle = ev_loop.insert(WriterWithTimeout).unwrap();
+ *     ev_loop.run_until_complete(handle).unwrap();
+ * }
+ *
+ * ```
  */
 
 extern crate mio;

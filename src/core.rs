@@ -126,7 +126,7 @@ impl<T: Any + 'static + Send> Channel<T> {
  *         scope.expect_message::<i32>();
  *         Ok(true)
  *     }
- *     fn message<S: Scope<(), AnyEv>>(&mut self, scope: &mut S, message: Message) -> Response {
+ *     fn message<S: Scope<(), AnyEv>>(&mut self, _scope: &mut S, message: Message) -> Response {
  *         assert_eq!(*message.real_type(), TypeId::of::<i32>());
  *         assert_eq!(*message.mode(), DeliveryMode::Post(None));
  *         assert_eq!(message.get::<i32>().unwrap(), 42);
@@ -267,7 +267,7 @@ pub trait LoopIface<Context, Ev> {
      * # use eveboros::*;
      * struct UselessEvent;
      * impl<AnyEv: From<UselessEvent>> Event<u32, AnyEv> for UselessEvent {
-     *     fn init<S: Scope<u32, AnyEv>>(&mut self, scope: &mut S) -> Response {
+     *     fn init<S: Scope<u32, AnyEv>>(&mut self, _scope: &mut S) -> Response {
      *         Ok(false)
      *     }
      * }
@@ -497,10 +497,9 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      *         scope.io_register(t, Ready::writable(), PollOpt::empty()).unwrap();
      *         Ok(true)
      *     }
-     *     fn io<S: Scope<Context, AnyEv>>(&mut self, scope: &mut S, io: IoId, ready: Ready) -> Response {
+     *     fn io<S: Scope<Context, AnyEv>>(&mut self, scope: &mut S, io: IoId, _ready: Ready) -> Response {
      *         /*
-     *          * Try sending password. We probably should check for short writes, but this is an
-     *          * example.
+     *          * Try sending password.
      *          */
      *         scope.with_io(io, |stream: &mut TcpStream| {
      *             write!(stream, "root\nroot\n").unwrap();
