@@ -146,5 +146,6 @@ extern crate libc;
 pub mod error;
 mod core;
 mod recycler;
+mod stolen_cell;
 
 pub use core::{IoId,TimeoutId,Handle,Channel,Message,BackgroundId,Loop,LoopIface,Scope,Event,Response,DeliveryMode,ChildExit};

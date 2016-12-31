@@ -2,6 +2,7 @@
 
 use super::recycler::Recycler;
 use error::{Result,Error};
+use stolen_cell::StolenCell;
 use mio::{Poll,Events,Token,Ready,Evented,PollOpt};
 use mio::channel::{Receiver,Sender,channel,SendError};
 use mio::unix::EventedFd;
@@ -24,7 +25,6 @@ use std::convert::From;
 use std::any::TypeId;
 use std::sync::mpsc::TryRecvError;
 use std::os::unix::io::AsRawFd;
-use std::cell::UnsafeCell;
 
 /// An opaque handle for event's IO
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
@@ -722,18 +722,12 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
 
 struct EvHolder<Event> {
     /*
-     * Originaly, we had Option<Event> and took it out onto stack every time we invoked a callback
-     * on it and returned it once the callback was done. That made the borrow checker happy. But it
-     * meant copying the (possibly large) event out and in in every callback, which may be slow.
-     *
-     * So we now emulate the option without really taking the thing really out, by setting a
-     * boolean and juggling with an UnsafeCell. That is a bit ugly, but should be safe as long as
-     * we update and check the boolean.
-     *
-     * Any way to make this into a separate object reasonably?
+     * Becase we need to pass a mutable reference to both the loop and the event (which lives
+     * inside the loop), we need to cheat the borrow checker a bit. The original solution of having
+     * Option<Event> and taking it out and then returning it back worked, but was clumsy. This way
+     * we pretend to take it out and back, but without the actual taking and returning.
      */
-    event: UnsafeCell<Event>,
-    event_stolen: bool,
+    event: StolenCell<Event>,
     generation: u64,
     // How many timeouts does it have?
     timeouts: usize,
@@ -971,9 +965,8 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         for child in event.children.into_iter() {
             self.children.remove(&child);
         }
-        // Return the internal event, but only if it is not currently busy
-        assert!(!event.event_stolen);
-        unsafe { event.event.into_inner() }
+        // Return the internal event
+        event.event.into_inner()
     }
     /// Run function on an event, with the scope and result checking
     fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: Handle, f: F) -> Result<()> {
@@ -985,19 +978,23 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             return Err(Error::Missing)
         }
         // Try to extract the event out (because of the borrow checker)
-        if !self.events[handle.id].event_stolen {
-            let event = unsafe { self.events[handle.id].event.get().as_mut().unwrap() };
-            self.events[handle.id].event_stolen = true;
+        if !self.events[handle.id].event.stolen() {
+            let mut event = self.events[handle.id].event.steal();
             // Perform the call
             let result = {
                 let mut scope: LoopScope<Self> = LoopScope {
                     event_loop: self,
                     handle: handle,
                 };
-                f(event, &mut scope)
+                /*
+                 * Technically safe. The only bad thing that could happen is the
+                 * self.events[handle.id].event going away while we access it, but that just
+                 * doesn't happen here.
+                 */
+                f( unsafe { event.as_mut() }, &mut scope)
             };
             // Return the event we took out
-            self.events[handle.id].event_stolen = false;
+            self.events[handle.id].event.unsteal(event);
             match result {
                 Ok(true) => (), // Keep the event alive
                 Ok(false) => { self.event_kill(handle.id); }, // Kill it as asked for
@@ -1360,8 +1357,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
         self.generation += Wrapping(1);
         // Store the event in the storage
         let idx = self.events.store(EvHolder {
-            event: UnsafeCell::new(event.into()),
-            event_stolen: false,
+            event: StolenCell::new(event.into()),
             generation: generation,
             timeouts: 0,
             ios: HashMap::new(),
@@ -1424,7 +1420,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
              * on. We know the event is alive, so we don't have to check for the validity of
              * the id or if it got reused.
              */
-            if !checked && self.events[handle.id].event_stolen {
+            if !checked && self.events[handle.id].event.stolen() {
                 return Err(Error::DeadLock)
             }
             checked = true;
