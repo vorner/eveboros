@@ -44,17 +44,17 @@ pub struct Handle {
 /**
  * A thread-safe channel to notify events.
  *
- * It is possible to create a channel that allows sending specific type of data to specific event
+ * It is possible to create a channel that allows sending data to specific event
  * in the event loop. This channel can be sent to another thread. If you don't need thread safety,
  * you can use [Loop::send](struct.Loop.html#method.send) or
  * [Loop::post](struct.Loop.html#method.post).
  *
- * When the channel is created (by [Loop::channel](struct.Loop.html#method.channel)), it is
- * checked that the event is still alive and accepts the type of data. However, there's no
- * notification through the channel when the event dies ‒ further messages will simply disappear.
- * However, when the originating event loop is destroyed, the channel returns
- * [Error::LoopGone](error/enum.Error.html)
- * when attempting to send a message.
+ * When the channel is created (by [Loop::channel](struct.Loop.html#method.channel)), it is checked
+ * that the event is still alive. However, there's no notification through the channel when the
+ * event dies ‒ further messages will simply disappear.  However, when the originating event loop
+ * is destroyed, the channel returns [Error::LoopGone](error/enum.Error.html) when attempting to
+ * send a message. Also, it is not checked the recipient can accept this type of message. If it
+ * doesn't, the message is simply dropped.
  *
  * # Examples
  *
@@ -78,7 +78,7 @@ pub struct Handle {
  * fn main() {
  *     let mut l: Loop<(), Recipient> = Loop::new(()).unwrap();
  *     let handle = l.insert(Recipient).unwrap();
- *     let mut channel = l.channel::<()>(handle).unwrap();
+ *     let mut channel = l.channel(handle).unwrap();
  *     thread::spawn(move || {
  *         channel.send(()).unwrap();
  *     });
@@ -87,15 +87,14 @@ pub struct Handle {
  * ```
  */
 #[derive(Clone)]
-pub struct Channel<T: Any + 'static + Send> {
+pub struct Channel {
     sender: Sender<RemoteMessage>,
     handle: Handle,
-    _data: PhantomData<T>,
 }
 
-impl<T: Any + 'static + Send> Channel<T> {
+impl Channel {
     /// Send a message to the corresponding event.
-    pub fn send(&mut self, data: T) -> Result<()> {
+    pub fn send<T: Any + 'static + Send>(&mut self, data: T) -> Result<()> {
         self.sender.send(RemoteMessage {
             recipient: self.handle,
             data: Box::new(data),
@@ -195,95 +194,20 @@ struct RemoteMessage {
 }
 
 /**
- * An object that can control an event loop.
+ * This is the object safe part of [LoopIface](trait.LoopIface.html).
  *
- * There are certain operations that can be done on the message loop [Loop](struct.Loop.html).
- * However, sometimes it is accessed through a proxy object. All these objects (including the loop)
- * implement this trait.
- *
- * [Scopes](trait.Scope.html) passed to message callbacks also implement the loop interface.
- *
- * It is not expected users of this library to *implement* this trait, only use it.
+ * The split into object-safe part and the rest allows wrapping the scope into an Box or something.
  */
-pub trait LoopIface<Context, Ev> {
+pub trait LoopIfaceObjSafe<Context, Ev> {
     /**
-     * Insert another event into the event loop.
+     * Insert the concrete, converted, event.
      *
-     * It returns a handle representing the event inside the loop.
-     *
-     * The reason why it takes events convertible to the one the loop operates on is composition.
-     * This way, if all the events properly accept scopes with generic events the current one is
-     * convertible to, it is possible to create an event wrapping multiple such ones without
-     * modifying the underlying events.
-     *
-     * # Examples
-     *
-     * This is the good way:
-     *
-     * ```
-     * # use eveboros::*;
-     *
-     * struct SomeEvent;
-     *
-     * // This can be put in many different Loops
-     * impl<Context, AnyEv: From<SomeEvent>> Event<Context, AnyEv> for SomeEvent {
-     *     fn init<S: Scope<Context, AnyEv>>(&mut self, scope: &mut S) -> Response {
-     *         // Note that this'll recursively insert infinite number of events
-     *         scope.insert(SomeEvent)?; // Insert another event of the same type as us
-     *         Ok(true)
-     *     }
-     * }
-     *
-     * # fn main() {}
-     * ```
-     *
-     * But this way prevents the event from being reused inside some wrapper:
-     *
-     * ```
-     * # use eveboros::*;
-     *
-     * struct SomeEvent;
-     *
-     * // This way it can be put only into Loop<(), SomeEvent>
-     * impl Event<(), SomeEvent> for SomeEvent {
-     *     fn init<S: Scope<(), SomeEvent>>(&mut self, scope: &mut S) -> Response {
-     *         scope.insert(SomeEvent)?;
-     *         Ok(true)
-     *     }
-     * }
-     *
-     * # fn main() {}
-     * ```
+     * The user should use [trait.LoopIface.html#tymethod.insert) instead. This is simply used to
+     * provide means of implementing it around object safe interface.
      */
-    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny>;
-    /**
-     * Access the context inside the loop.
-     *
-     * Run a closure that gets the (mutable) global context inside the event loop. The result of
-     * the closure is propagated as the result of this method.
-     *
-     * # Examples
-     *
-     * ```
-     * # use eveboros::*;
-     * struct UselessEvent;
-     * impl<AnyEv: From<UselessEvent>> Event<u32, AnyEv> for UselessEvent {
-     *     fn init<S: Scope<u32, AnyEv>>(&mut self, _scope: &mut S) -> Response {
-     *         Ok(false)
-     *     }
-     * }
-     *
-     * fn main() {
-     *     let mut l: Loop<u32, UselessEvent> = Loop::new(42).unwrap();
-     *     l.with_context(|context| {
-     *         assert_eq!(42, *context);
-     *         *context = 0;
-     *         Ok(())
-     *     }).unwrap();
-     * }
-     * ```
-     */
-    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()>;
+    fn insert_exact(&mut self, event: Ev) -> Result<Handle>;
+    /// Get a context accessor
+    fn context(&mut self) -> &mut Context;
     /**
      * Run one iteration of the event loop.
      *
@@ -347,6 +271,116 @@ pub trait LoopIface<Context, Ev> {
      * long time.
      */
     fn now(&self) -> &Instant;
+    /// Low-level implementation of send
+    fn send_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()>;
+    /// Low-level implementation of post
+    fn post_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()>;
+    /**
+     * Create a communication channel.
+     *
+     * This allows sending of messages from a foreign thread. See documentation for the
+     * [channel](struct.Channel.html) for more details.
+     *
+     * If you want to communicate from the same thread, using [post](#tymethod.post) and
+     * [send](#tymethod.send) may be more convenient.
+     */
+    fn channel(&mut self, handle: Handle) -> Result<Channel>;
+}
+
+/**
+ * An object that can control an event loop.
+ *
+ * There are certain operations that can be done on the message loop [Loop](struct.Loop.html).
+ * However, sometimes it is accessed through a proxy object. All these objects (including the loop)
+ * implement this trait.
+ *
+ * [Scopes](trait.Scope.html) passed to message callbacks also implement the loop interface.
+ *
+ * It is not expected users of this library to *implement* this trait, only use it.
+ */
+pub trait LoopIface<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
+    /**
+     * Insert another event into the event loop.
+     *
+     * It returns a handle representing the event inside the loop.
+     *
+     * The reason why it takes events convertible to the one the loop operates on is composition.
+     * This way, if all the events properly accept scopes with generic events the current one is
+     * convertible to, it is possible to create an event wrapping multiple such ones without
+     * modifying the underlying events.
+     *
+     * # Examples
+     *
+     * This is the good way:
+     *
+     * ```
+     * # use eveboros::*;
+     *
+     * struct SomeEvent;
+     *
+     * // This can be put in many different Loops
+     * impl<Context, AnyEv: From<SomeEvent>> Event<Context, AnyEv> for SomeEvent {
+     *     fn init<S: Scope<Context, AnyEv>>(&mut self, scope: &mut S) -> Response {
+     *         // Note that this'll recursively insert infinite number of events
+     *         scope.insert(SomeEvent)?; // Insert another event of the same type as us
+     *         Ok(true)
+     *     }
+     * }
+     *
+     * # fn main() {}
+     * ```
+     *
+     * But this way prevents the event from being reused inside some wrapper:
+     *
+     * ```
+     * # use eveboros::*;
+     *
+     * struct SomeEvent;
+     *
+     * // This way it can be put only into Loop<(), SomeEvent>
+     * impl Event<(), SomeEvent> for SomeEvent {
+     *     fn init<S: Scope<(), SomeEvent>>(&mut self, scope: &mut S) -> Response {
+     *         scope.insert(SomeEvent)?;
+     *         Ok(true)
+     *     }
+     * }
+     *
+     * # fn main() {}
+     * ```
+     */
+    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> {
+        self.insert_exact(event.into())
+    }
+    /**
+     * Access the context inside the loop.
+     *
+     * Run a closure that gets the (mutable) global context inside the event loop. The result of
+     * the closure is propagated as the result of this method.
+     *
+     * # Examples
+     *
+     * ```
+     * # use eveboros::*;
+     * struct UselessEvent;
+     * impl<AnyEv: From<UselessEvent>> Event<u32, AnyEv> for UselessEvent {
+     *     fn init<S: Scope<u32, AnyEv>>(&mut self, _scope: &mut S) -> Response {
+     *         Ok(false)
+     *     }
+     * }
+     *
+     * fn main() {
+     *     let mut l: Loop<u32, UselessEvent> = Loop::new(42).unwrap();
+     *     l.with_context(|context| {
+     *         assert_eq!(42, *context);
+     *         *context = 0;
+     *         Ok(())
+     *     }).unwrap();
+     * }
+     * ```
+     */
+    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> {
+        f(self.context())
+    }
     /**
      * Send some data to the event asynchronously.
      *
@@ -366,7 +400,9 @@ pub trait LoopIface<Context, Ev> {
      * * `Error::MsgUnexpected` if the event has't declared it is ready to receive this type of
      *   data.
      */
-    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()>;
+    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.send_impl(handle, Box::new(data), TypeId::of::<T>())
+    }
     /**
      * Send some data to the event synchronously.
      *
@@ -382,17 +418,9 @@ pub trait LoopIface<Context, Ev> {
      *   data.
      * * `Error::Busy` if the target event is currently in the middle of a callback.
      */
-    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()>;
-    /**
-     * Create a communication channel.
-     *
-     * This allows sending of messages from a foreign thread. See documentation for the
-     * [channel](struct.Channel.html) for more details.
-     *
-     * If you want to communicate from the same thread, using [post](#tymethod.post) and
-     * [send](#tymethod.send) may be more convenient.
-     */
-    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>>;
+    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
+        self.post_impl(handle, Box::new(data), TypeId::of::<T>())
+    }
 }
 
 /**
@@ -1096,14 +1124,26 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
                         match self.receiver.try_recv() {
                             Err(TryRecvError::Empty) => break, // We have read everything, return next time
                             Err(TryRecvError::Disconnected) => unreachable!(), // We hold one copy of sender ourselves
-                            Ok(remote_message) => self.scheduled.push_back(Task {
-                                recipient: remote_message.recipient,
-                                param: TaskParam::Message(Message {
-                                    data: remote_message.data,
-                                    real_type: remote_message.real_type,
-                                    mode: remote_message.mode,
-                                }),
-                            }),
+                            Ok(remote_message) => {
+                                /*
+                                 * We need to check the allowed types (because remote channels
+                                 * don't do it)
+                                 */
+                                let passed = match remote_message.mode {
+                                    DeliveryMode::Background(_) => true,
+                                    _ => self.msg_type_check(remote_message.recipient, &remote_message.real_type).is_ok(),
+                                };
+                                if passed {
+                                    self.scheduled.push_back(Task {
+                                        recipient: remote_message.recipient,
+                                        param: TaskParam::Message(Message {
+                                            data: remote_message.data,
+                                            real_type: remote_message.real_type,
+                                            mode: remote_message.mode,
+                                        }),
+                                    })
+                                }
+                            },
                         }
                     }
                 },
@@ -1239,26 +1279,24 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         }
     }
     /// An implementaion of the send method
-    fn send_impl<T: Any + 'static>(&mut self, from: Option<Handle>, handle: Handle, data: T) -> Result<()> {
-        let t = TypeId::of::<T>();
-        self.msg_type_check(handle, &t)?;
+    fn send_impl_sender(&mut self, from: Option<Handle>, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.msg_type_check(handle, &tp)?;
         self.scheduled.push_back(Task {
             recipient: handle,
             param: TaskParam::Message(Message {
-                data: Box::new(data),
-                real_type: t,
+                data: data,
+                real_type: tp,
                 mode: DeliveryMode::Send(from),
             }),
         });
         Ok(())
     }
     /// An implementation of the post method.
-    fn post_impl<T: Any + 'static>(&mut self, from: Option<Handle>, handle: Handle, data: T) -> Result<()> {
-        let t = TypeId::of::<T>();
-        self.msg_type_check(handle, &t)?;
-        self.event_call(handle, |event, context| event.message(context, Message {
-            data: Box::new(data),
-            real_type: t,
+    fn post_impl_sender(&mut self, from: Option<Handle>, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.msg_type_check(handle, &tp)?;
+        self.event_call(handle, |event, scope| event.message(scope, Message {
+            data: data,
+            real_type: tp,
             mode: DeliveryMode::Post(from),
         }))
     }
@@ -1350,14 +1388,14 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     }
 }
 
-impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {
-    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> {
+impl<Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for Loop<Context, Ev> {
+    fn insert_exact(&mut self, event: Ev) -> Result<Handle> {
         // Assign a new generation
         let Wrapping(generation) = self.generation;
         self.generation += Wrapping(1);
         // Store the event in the storage
         let idx = self.events.store(EvHolder {
-            event: StolenCell::new(event.into()),
+            event: StolenCell::new(event),
             generation: generation,
             timeouts: 0,
             ios: HashMap::new(),
@@ -1370,11 +1408,11 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
             generation: generation
         };
         // Run the init for the event
-        self.event_call(handle, |event, context| event.init(context))?;
+        self.event_call(handle, |event, scope| event.init(scope))?;
         Ok(handle)
     }
-    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> {
-        f(&mut self.context)
+    fn context(&mut self) -> &mut Context {
+        &mut self.context
     }
     fn run_one(&mut self) -> Result<()> {
         // FIXME: We need to postpone events in case they are currently active.
@@ -1392,7 +1430,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                         idx -= TOKEN_SHIFT;
                         // Check that the IO is still valid
                         if self.events[task.recipient.id].ios.contains_key(&idx) {
-                            self.event_call(task.recipient, |event, context| event.io(context, id, ready))
+                            self.event_call(task.recipient, |event, scope| event.io(scope, id, ready))
                         } else {
                             // It's OK to lose the IO in the meantime
                             Ok(())
@@ -1401,12 +1439,12 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
                     TaskParam::Timeout(id) => {
                         self.timeouts_fired += 1;
                         self.events[task.recipient.id].timeouts -= 1;
-                        self.event_call(task.recipient, |event, context| event.timeout(context, id))
+                        self.event_call(task.recipient, |event, scope| event.timeout(scope, id))
                     },
-                    TaskParam::Signal(signal) => self.event_call(task.recipient, |event, context| event.signal(context, signal)),
-                    TaskParam::Idle => self.event_call(task.recipient, |event, context| event.idle(context)),
-                    TaskParam::Message(message) => self.event_call(task.recipient, |event, context| event.message(context, message)),
-                    TaskParam::Child(pid, exit) => self.event_call(task.recipient, |event, context| event.child(context, pid, exit)),
+                    TaskParam::Signal(signal) => self.event_call(task.recipient, |event, scope| event.signal(scope, signal)),
+                    TaskParam::Idle => self.event_call(task.recipient, |event, scope| event.idle(scope)),
+                    TaskParam::Message(message) => self.event_call(task.recipient, |event, scope| event.message(scope, message)),
+                    TaskParam::Child(pid, exit) => self.event_call(task.recipient, |event, scope| event.child(scope, pid, exit)),
                 }
             }
         }
@@ -1443,22 +1481,21 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
     }
     fn event_count(&self) -> usize { self.events.len() }
     fn now(&self) -> &Instant { &self.now }
-    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
-        self.send_impl(None, handle, data)
+    fn send_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.send_impl_sender(None, handle, data, tp)
     }
-    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
-        self.post_impl(None, handle, data)
+    fn post_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.post_impl_sender(None, handle, data, tp)
     }
-    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>> {
-        let t = TypeId::of::<T>();
-        self.msg_type_check(handle, &t)?;
+    fn channel(&mut self, handle: Handle) -> Result<Channel> {
         Ok(Channel {
             sender: self.sender.clone(),
             handle: handle,
-            _data: PhantomData,
         })
     }
 }
+
+impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {}
 
 struct LoopScope<'a, Loop: 'a> {
     event_loop: &'a mut Loop,
@@ -1492,9 +1529,9 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopScope<'a, Loop<Context, Ev>> {
     }
 }
 
-impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
-    fn insert<EvAny>(&mut self, event: EvAny) -> Result<Handle> where Ev: From<EvAny> { self.event_loop.insert(event) }
-    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> { self.event_loop.with_context(f) }
+impl<'a, Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
+    fn insert_exact(&mut self, event: Ev) -> Result<Handle> { self.event_loop.insert_exact(event) }
+    fn context(&mut self) -> &mut Context { &mut self.event_loop.context }
     fn stop(&mut self) { self.event_loop.stop() }
     fn run_one(&mut self) -> Result<()> { self.event_loop.run_one() }
     fn run_until_complete(&mut self, handle: Handle) -> Result<()> { self.event_loop.run_until_complete(handle) }
@@ -1502,14 +1539,16 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'
     fn event_alive(&self, handle: Handle) -> bool { self.event_loop.event_alive(handle) }
     fn event_count(&self) -> usize { self.event_loop.event_count() }
     fn now(&self) -> &Instant { self.event_loop.now() }
-    fn send<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
-        self.event_loop.send_impl(Some(self.handle), handle, data)
+    fn send_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.event_loop.send_impl_sender(Some(self.handle), handle, data, tp)
     }
-    fn post<T: Any + 'static>(&mut self, handle: Handle, data: T) -> Result<()> {
-        self.event_loop.post_impl(Some(self.handle), handle, data)
+    fn post_impl(&mut self, handle: Handle, data: Box<Any + 'static>, tp: TypeId) -> Result<()> {
+        self.event_loop.post_impl_sender(Some(self.handle), handle, data, tp)
     }
-    fn channel<T: Any + 'static + Send>(&mut self, handle: Handle) -> Result<Channel<T>> { self.event_loop.channel(handle) }
+    fn channel(&mut self, handle: Handle) -> Result<Channel> { self.event_loop.channel(handle) }
 }
+
+impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {}
 
 impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> Handle { self.handle }
@@ -1794,8 +1833,7 @@ mod tests {
     fn channel_hello() {
         let mut l: Loop<(), RemoteRecipient> = Loop::new(()).unwrap();
         let handle = l.insert(RemoteRecipient).unwrap();
-        err!(l.channel::<()>(handle), Error::MsgUnexpected);
-        let mut ch = l.channel::<RemoteHello>(handle).unwrap();
+        let mut ch = l.channel(handle).unwrap();
         let thread = spawn(move || {
             let (sender, receiver) = channel::<()>();
             // Send a hello to the event in a loop in another thread and wait for an answer

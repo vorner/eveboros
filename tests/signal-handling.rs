@@ -11,7 +11,7 @@ extern crate libc;
  * (without running the rest of the tests). But that's enough for this.
  */
 
-use eveboros::{Loop,Event,Scope,Response,ChildExit,LoopIface};
+use eveboros::{Loop,Event,Scope,Response,ChildExit,LoopIface,LoopIfaceObjSafe};
 use nix::sys::signal::{raise,Signal};
 use nix::unistd::{ForkResult,fork};
 use libc::pid_t;
