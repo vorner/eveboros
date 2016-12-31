@@ -24,6 +24,7 @@ use std::convert::From;
 use std::any::TypeId;
 use std::sync::mpsc::TryRecvError;
 use std::os::unix::io::AsRawFd;
+use std::cell::UnsafeCell;
 
 /// An opaque handle for event's IO
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
@@ -720,7 +721,19 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
 }
 
 struct EvHolder<Event> {
-    event: Option<Event>,
+    /*
+     * Originaly, we had Option<Event> and took it out onto stack every time we invoked a callback
+     * on it and returned it once the callback was done. That made the borrow checker happy. But it
+     * meant copying the (possibly large) event out and in in every callback, which may be slow.
+     *
+     * So we now emulate the option without really taking the thing really out, by setting a
+     * boolean and juggling with an UnsafeCell. That is a bit ugly, but should be safe as long as
+     * we update and check the boolean.
+     *
+     * Any way to make this into a separate object reasonably?
+     */
+    event: UnsafeCell<Event>,
+    event_stolen: bool,
     generation: u64,
     // How many timeouts does it have?
     timeouts: usize,
@@ -937,7 +950,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
      */
     pub fn error_handler_set(&mut self, handler: ErrorHandler<Ev>) { self.error_handler = handler }
     /// Kill an event at given index.
-    fn event_kill(&mut self, idx: usize) -> Option<Ev> {
+    fn event_kill(&mut self, idx: usize) -> Ev {
         let event = self.events.release(idx);
         // These timeouts are dead now
         self.timeouts_dead += event.timeouts;
@@ -958,7 +971,9 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         for child in event.children.into_iter() {
             self.children.remove(&child);
         }
-        event.event
+        // Return the internal event, but only if it is not currently busy
+        assert!(!event.event_stolen);
+        unsafe { event.event.into_inner() }
     }
     /// Run function on an event, with the scope and result checking
     fn event_call<F: FnOnce(&mut Ev, &mut LoopScope<Self>) -> Response>(&mut self, handle: Handle, f: F) -> Result<()> {
@@ -970,23 +985,25 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             return Err(Error::Missing)
         }
         // Try to extract the event out (because of the borrow checker)
-        if let Some(mut event) = self.events[handle.id].event.take() {
+        if !self.events[handle.id].event_stolen {
+            let event = unsafe { self.events[handle.id].event.get().as_mut().unwrap() };
+            self.events[handle.id].event_stolen = true;
             // Perform the call
             let result = {
                 let mut scope: LoopScope<Self> = LoopScope {
                     event_loop: self,
                     handle: handle,
                 };
-                f(&mut event, &mut scope)
+                f(event, &mut scope)
             };
             // Return the event we took out
-            self.events[handle.id].event = Some(event);
+            self.events[handle.id].event_stolen = false;
             match result {
                 Ok(true) => (), // Keep the event alive
                 Ok(false) => { self.event_kill(handle.id); }, // Kill it as asked for
                 Err(err) => {
                     // We can unwrap, we just returned the event there a moment ago
-                    let event = self.event_kill(handle.id).unwrap();
+                    let event = self.event_kill(handle.id);
                     /*
                      * Call the error handler with the broken event and propagate any error it
                      * returns
@@ -1343,7 +1360,8 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
         self.generation += Wrapping(1);
         // Store the event in the storage
         let idx = self.events.store(EvHolder {
-            event: Some(event.into()),
+            event: UnsafeCell::new(event.into()),
+            event_stolen: false,
             generation: generation,
             timeouts: 0,
             ios: HashMap::new(),
@@ -1406,7 +1424,7 @@ impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, E
              * on. We know the event is alive, so we don't have to check for the validity of
              * the id or if it got reused.
              */
-            if !checked && self.events[handle.id].event.is_none() {
+            if !checked && self.events[handle.id].event_stolen {
                 return Err(Error::DeadLock)
             }
             checked = true;
