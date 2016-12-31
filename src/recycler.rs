@@ -1,4 +1,4 @@
-/*!:
+/*!
  * Something like the slab allocator, but can grow when there's not enough space.
  */
 use std::ops::{Index,IndexMut};

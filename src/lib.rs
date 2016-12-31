@@ -144,6 +144,7 @@ extern crate nix;
 extern crate libc;
 
 pub mod error;
+pub mod adapt;
 mod core;
 mod recycler;
 mod stolen_cell;
