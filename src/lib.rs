@@ -149,4 +149,4 @@ mod core;
 mod recycler;
 mod stolen_cell;
 
-pub use core::{IoId,TimeoutId,Handle,Channel,Message,BackgroundId,Loop,LoopIface,LoopIfaceObjSafe,Scope,Event,Response,DeliveryMode,ChildExit};
+pub use core::{IoId,TimeoutId,Handle,Channel,Message,BackgroundId,Loop,LoopIface,LoopIfaceObjSafe,Scope,ScopeObjSafe,Event,Response,DeliveryMode,ChildExit,IoHolderAny,TaskWrapper};

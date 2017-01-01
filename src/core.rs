@@ -428,6 +428,11 @@ pub trait LoopIface<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     }
 }
 
+// Implement it for trait objects
+impl<Context, ScopeEvent> LoopIface<Context, ScopeEvent> for LoopIfaceObjSafe<Context, ScopeEvent> {}
+// Implement it for concrete objects
+impl<Context, ScopeEvent, Obj: LoopIfaceObjSafe<Context, ScopeEvent>> LoopIface<Context, ScopeEvent> for Obj {}
+
 /**
  * An object-safe subset of the [Scope](trait.Scope.html) trait.
  */
@@ -702,6 +707,11 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> + ScopeObjSafe<Context, Ev>
     }
 }
 
+// Implement it for trait objects
+//impl<Context, ScopeEvent> Scope<Context, ScopeEvent> for ScopeObjSafe<Context, ScopeEvent> {}
+// Implement it for concrete types
+impl<Context, ScopeEvent, Obj: ScopeObjSafe<Context, ScopeEvent>> Scope<Context, ScopeEvent> for Obj {}
+
 /// Common response of the Event.
 pub type Response = Result<bool>;
 
@@ -767,13 +777,14 @@ pub enum ChildExit {
  * The Context can serve as a global storage accessible from all the events.
  *
  * The ScopeEvent is usually this Event. However, it may be some type this is convertible to and
- * allows the loop to contain multiple „base“ events at once.
+ * allows the loop to contain multiple „base“ events at once. If you implement the corresponding
+ * `From` trait, it can be inserted directly.
  *
  * Except for the [init](#tymethod.init) method, all these callbacks have a default (error-raising)
  * implementation. The reason is, most events don't need all of them. If you don't register for
  * something, you don't have to implement the corresponding callback.
  */
-pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
+pub trait Event<Context, ScopeEvent> where Self: Sized {
     /**
      * Called during insertion.
      *
@@ -1580,8 +1591,6 @@ impl<Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for Loop<Con
     }
 }
 
-impl<Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for Loop<Context, Ev> {}
-
 struct LoopScope<'a, Loop: 'a> {
     event_loop: &'a mut Loop,
     handle: Handle,
@@ -1617,8 +1626,6 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for Loop
     }
     fn channel(&mut self, handle: Handle) -> Result<Channel> { self.event_loop.channel(handle) }
 }
-
-impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {}
 
 impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> Handle { self.handle }
@@ -1690,8 +1697,6 @@ impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScop
         Ok(())
     }
 }
-
-impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {}
 
 #[cfg(test)]
 mod tests {
