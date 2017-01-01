@@ -61,12 +61,13 @@ pub struct Handle {
  * ```
  * use eveboros::*;
  * use std::thread;
+ * use std::any::TypeId;
  *
  * struct Recipient;
  *
  * impl<AnyEv: From<Recipient>> Event<(), AnyEv> for Recipient {
  *     fn init<S: Scope<(), AnyEv>>(&mut self, scope: &mut S) -> Response {
- *         scope.expect_message::<()>();
+ *         scope.expect_message(TypeId::of::<()>());
  *         Ok(true)
  *     }
  *     fn message<S: Scope<(), AnyEv>>(&mut self, scope: &mut S, _message: Message) -> Response {
@@ -123,7 +124,7 @@ impl Channel {
  *
  * impl<AnyEv: From<Recipient>> Event<(), AnyEv> for Recipient {
  *     fn init<S: Scope<(), AnyEv>>(&mut self, scope: &mut S) -> Response {
- *         scope.expect_message::<i32>();
+ *         scope.expect_message(TypeId::of::<i32>());
  *         Ok(true)
  *     }
  *     fn message<S: Scope<(), AnyEv>>(&mut self, _scope: &mut S, message: Message) -> Response {
@@ -184,9 +185,13 @@ impl Message {
     pub fn mode(&self) -> &DeliveryMode { &self.mode }
 }
 
-// For sending between threads. A corresponding task containing Message will get created locally.
+/**
+ * For sending messages between threads.
+ *
+ * Public to make the compiler happy, mostly. Not to be interacted with directly.
+ */
 #[derive(Debug)]
-struct RemoteMessage {
+pub struct RemoteMessage {
     data: Box<Any + 'static + Send>,
     real_type: TypeId,
     mode: DeliveryMode,
@@ -424,21 +429,9 @@ pub trait LoopIface<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
 }
 
 /**
- * Necessary information passed to every callback.
- *
- * An object implementing this trait is passed to each callback of an event. It allows manipulating
- * both the underlying event loop (through the inherited [LoopIface](trait.LoopIface.html) trait)
- * and the state of the event (like registering timeouts and other things).
- *
- * The scope is different for each event (because it knows which event it is for).
- *
- * Also, the concrete data types implementing this are not public, on purpose. Various proxy or
- * abstracting layers implement different scopes and it is not desirable to have events not
- * working with them.
- *
- * It is not expected users of this library to *implement* this trait, only use it.
+ * An object-safe subset of the [Scope](trait.Scope.html) trait.
  */
-pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
+pub trait ScopeObjSafe<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     /// The handle of the current event.
     fn handle(&self) -> Handle;
     /**
@@ -497,6 +490,84 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
         self.timeout_at(at)
     }
     /**
+     * Show interest in receiving these types of signals.
+     *
+     * This also automatically enables the loop's handling of this signal.
+     */
+    fn signal(&mut self, signal: Signal) -> Result<()>;
+    /**
+     * Run code when the loop is idle.
+     *
+     * Run the [idle](trait.Event.html#tymethod.idle) callback once the event loop has nothing
+     * better than you. It is possible to register only one idle callback at a time, but it is
+     * possible to register a new one from the `idle` callback itself.
+     */
+    fn idle(&mut self);
+    /**
+     * Allow receiving of messages of the given type.
+     *
+     * Note that you don't have to do this to receive results from background tasks, they get
+     * allowed automatically.
+     *
+     * As the type can't be deduced from the parameters, you have to call it as
+     * `scope.expect_message::<i32>()` (or with any other type you want).
+     */
+    fn expect_message(&mut self, tp: TypeId);
+    /// Register any evented holder
+    fn io_register_any(&mut self, io: Box<IoHolderAny>, interest: Ready, opts: PollOpt) -> Result<IoId>;
+    /// Borrow the IO
+    fn io_mut(&mut self, id: IoId) -> Result<&mut Box<IoHolderAny>>;
+    /**
+     * Modify the events watched on the given IO.
+     */
+    fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()>;
+    /**
+     * Stop watching the given IO.
+     *
+     * The IO is destroyed. It is planned this will return the ID, but this is not yet implemented.
+     */
+    fn io_remove(&mut self, id: IoId) -> Result<()>;
+    /// Submit a task to a background thread
+    fn background_submit(&mut self, task: Box<TaskWrapper>) -> Result<BackgroundId>;
+    /**
+     * Track a child process.
+     *
+     * It is not allowed to track the same child by multiple events. Also, this registers the
+     * SIGCHLD signal into the loop.
+     *
+     * It's not possible to track children not started by this process.
+     *
+     * # Note
+     *
+     * You might want to enable SIGCHLD on the event loop before forking/starting the child to
+     * avoid race conditions (the child terminating sooner than the SIGCHLD is enabled, leading to
+     * missed signal).
+     *
+     * # Panics
+     *
+     * It panics if you try to register the same `pid` multiple times (by either the same or
+     * different events) into the same loop.
+     */
+    fn child(&mut self, pid: pid_t) -> Result<()>;
+}
+
+/**
+ * Necessary information passed to every callback.
+ *
+ * An object implementing this trait is passed to each callback of an event. It allows manipulating
+ * both the underlying event loop (through the inherited [LoopIface](trait.LoopIface.html) trait)
+ * and the state of the event (like registering timeouts and other things).
+ *
+ * The scope is different for each event (because it knows which event it is for).
+ *
+ * Also, the concrete data types implementing this are not public, on purpose. Various proxy or
+ * abstracting layers implement different scopes and it is not desirable to have events not
+ * working with them.
+ *
+ * It is not expected users of this library to *implement* this trait, only use it.
+ */
+pub trait Scope<Context, Ev>: LoopIface<Context, Ev> + ScopeObjSafe<Context, Ev> {
+    /**
      * Watch a MIO Evented.
      *
      * Watch something that MIO can watch. It is usually a socket or something like that. Set what
@@ -542,47 +613,23 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      * # fn main() {}
      * ```
      */
-    fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId>;
-    /**
-     * Modify the events watched on the given IO.
-     */
-    fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()>;
-    /**
-     * Stop watching the given IO.
-     *
-     * The IO is destroyed. It is planned this will return the ID, but this is not yet implemented.
-     */
-    fn io_remove(&mut self, id: IoId) -> Result<()>;
+    fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
+        let handle = self.handle();
+        self.io_register_any(Box::new(IoHolder {
+            recipient: handle,
+            io: io
+        }), interest, opts)
+    }
     /**
      * Access the watched IO.
      *
      * Get a mutable access to the IO passed to the loop to be watched.
      */
-    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R>;
-    /**
-     * Show interest in receiving these types of signals.
-     *
-     * This also automatically enables the loop's handling of this signal.
-     */
-    fn signal(&mut self, signal: Signal) -> Result<()>;
-    /**
-     * Run code when the loop is idle.
-     *
-     * Run the [idle](trait.Event.html#tymethod.idle) callback once the event loop has nothing
-     * better than you. It is possible to register only one idle callback at a time, but it is
-     * possible to register a new one from the `idle` callback itself.
-     */
-    fn idle(&mut self);
-    /**
-     * Allow receiving of messages of the given type.
-     *
-     * Note that you don't have to do this to receive results from background tasks, they get
-     * allowed automatically.
-     *
-     * As the type can't be deduced from the parameters, you have to call it as
-     * `scope.expect_message::<i32>()` (or with any other type you want).
-     */
-    fn expect_message<T: Any>(&mut self);
+    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R> {
+        // Get the boxed any-holder instance, cast it to Box<Any> and try to cast it.
+        let io: &mut IoHolder<E> = self.io_mut(id)?.as_any_mut().downcast_mut().ok_or(Error::IoType)?;
+        f(&mut io.io)
+    }
     /**
      * Run a task in the background, in another thread.
      *
@@ -597,7 +644,26 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      * `message.get::<R>()` only, as that already returns `Result<R>` (the errors of the function
      * are squashed together, as a convenience, with the errors from `get`tting the result.
      */
-    fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId>;
+    fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId> {
+        let handle = self.handle();
+        self.background_submit(Box::new(WrappedTask { f: Some(move |id, sender| {
+            let mut wrapper: BackgroundWrapper<R> = BackgroundWrapper {
+                requestor: handle,
+                id: id,
+                complete: false,
+                sender: sender,
+                _final: PhantomData,
+            };
+            let result = f();
+            let _ = wrapper.sender.send(RemoteMessage {
+                recipient: handle,
+                data: Box::new(result),
+                real_type: TypeId::of::<R>(),
+                mode: DeliveryMode::Background(id),
+            });
+            wrapper.complete = true;
+        })}))
+    }
     /**
      * This is similar to `background`, but produces multiple results instead of one.
      *
@@ -609,27 +675,31 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> {
      * iterator instead of one object holding all is better if generating them is slower than using
      * them.
      */
-    fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId>;
-    /**
-     * Track a child process.
-     *
-     * It is not allowed to track the same child by multiple events. Also, this registers the
-     * SIGCHLD signal into the loop.
-     *
-     * It's not possible to track children not started by this process.
-     *
-     * # Note
-     *
-     * You might want to enable SIGCHLD on the event loop before forking/starting the child to
-     * avoid race conditions (the child terminating sooner than the SIGCHLD is enabled, leading to
-     * missed signal).
-     *
-     * # Panics
-     *
-     * It panics if you try to register the same `pid` multiple times (by either the same or
-     * different events) into the same loop.
-     */
-    fn child(&mut self, pid: pid_t) -> Result<()>;
+    fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId> {
+        let handle = self.handle();
+        self.background_submit(Box::new(WrappedTask { f: Some(move |id: BackgroundId, sender: Sender<RemoteMessage>| {
+            let result = f();
+            { // Block, so send gets destroyed soon enough
+                let send = |value: Result<R>| {
+                    let _ = sender.send(RemoteMessage {
+                        recipient: handle,
+                        data: Box::new(value),
+                        real_type: TypeId::of::<R>(),
+                        mode: DeliveryMode::Background(id),
+                    });
+                };
+                match result {
+                    Ok(iter) => {
+                        for val in iter {
+                            send(Ok(val));
+                        }
+                        send(Err(Error::IterEnd));
+                    },
+                    Err(err) => send(Err(err)),
+                }
+            }
+        })}))
+    }
 }
 
 /// Common response of the Event.
@@ -741,7 +811,7 @@ pub trait Event<Context, ScopeEvent: From<Self>> where Self: Sized {
      * owner of the loop, sent through a channel from another thread or can be a result of a
      * [background](trait.Scope.html#tymethod.background) task. Except for the background tasks
      * (where the results are allways allowed), receipt of each type of a message must be
-     * explicitly allowed through [expect_message](trait.Scope.html#tymethod.expect_message).
+     * explicitly allowed through [expect_message](trait.ScopeObjSafe.html#tymethod.expect_message).
      */
     fn message<S: Scope<Context, ScopeEvent>>(&mut self, _scope: &mut S, _msg: Message) -> Response { Err(Error::DefaultImpl) }
     /// A watched process child terminated.
@@ -812,7 +882,8 @@ struct IoHolder<E: Evented> {
     io: E,
 }
 
-trait IoHolderAny: Any {
+/// This is public only formally O:-)
+pub trait IoHolderAny: Any {
     fn io(&self) -> &Evented;
     fn recipient(&self) -> Handle;
     fn as_any_mut(&mut self) -> &mut Any;
@@ -828,12 +899,26 @@ const TOKEN_SHIFT: usize = 2;
 const CHANNEL_TOK: Token = Token(0);
 const SIGNAL_TOK: Token = Token(1);
 
-struct BackgroundWrapper<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: Any + 'static + Send> {
+// Similar to FnOnce(), but one that can actually be passed where we want
+pub trait TaskWrapper: Send + 'static {
+    fn call(&mut self, id: BackgroundId, sender: Sender<RemoteMessage>);
+}
+
+struct WrappedTask<F: FnOnce(BackgroundId, Sender<RemoteMessage>) + Send + 'static> {
+    f: Option<F>,
+}
+
+impl<F: FnOnce(BackgroundId, Sender<RemoteMessage>) + Send + 'static> TaskWrapper for WrappedTask<F> {
+    fn call(&mut self, id: BackgroundId, sender: Sender<RemoteMessage>) {
+        (self.f.take().unwrap())(id, sender)
+    }
+}
+
+struct BackgroundWrapper<FinalR: Send + 'static> {
     requestor: Handle,
     id: BackgroundId,
-    complete: bool,
     sender: Sender<RemoteMessage>,
-    task: Option<F>,
+    complete: bool,
     _final: PhantomData<FinalR>,
 }
 
@@ -841,7 +926,7 @@ struct BackgroundWrapper<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: A
  * A trick. This gets called even whn we panic. So, we send a message it panicked in case it isn't
  * complete yet.
  */
-impl<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: Any + 'static + Send> Drop for BackgroundWrapper<R, F, FinalR> {
+impl<FinalR: Send + 'static> Drop for BackgroundWrapper<FinalR> {
     fn drop(&mut self) {
         if !self.complete {
             /*
@@ -1512,21 +1597,6 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopScope<'a, Loop<Context, Ev>> {
             Err(Error::MissingIo)
         }
     }
-    fn background_task<R, F: 'static + Send + FnOnce() -> Result<R>, FinalR: 'static + Send + Any>(&mut self, f: F) -> (BackgroundId, BackgroundWrapper<R, F, FinalR>) {
-        if self.event_loop.threadpool.is_none() {
-            self.event_loop.pool_thread_count_set(1);
-        }
-        let id = BackgroundId(self.event_loop.background_generation.0);
-        self.event_loop.background_generation += Wrapping(1);
-        (id, BackgroundWrapper {
-            requestor: self.handle,
-            id: id,
-            complete: false,
-            sender: self.event_loop.sender.clone(),
-            task: Some(f),
-            _final: PhantomData,
-        })
-    }
 }
 
 impl<'a, Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
@@ -1550,21 +1620,30 @@ impl<'a, Context, Ev: Event<Context, Ev>> LoopIfaceObjSafe<Context, Ev> for Loop
 
 impl<'a, Context, Ev: Event<Context, Ev>> LoopIface<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {}
 
-impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
+impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {
     fn handle(&self) -> Handle { self.handle }
     fn timeout_at(&mut self, when: Instant) -> TimeoutId { self.event_loop.timeout_at(self.handle, when) }
-    fn io_register<E: Evented + 'static>(&mut self, io: E, interest: Ready, opts: PollOpt) -> Result<IoId> {
+    fn idle(&mut self) {
+        self.event_loop.want_idle.insert(self.handle, ());
+    }
+    fn signal(&mut self, signal: Signal) -> Result<()> {
+        self.event_loop.signal_enable(signal)?;
+        let signum = signal as i32;
+        self.event_loop.signal_recipients.entry(signum).or_insert(HashSet::new()).insert(self.handle);
+        Ok(())
+    }
+    fn expect_message(&mut self, tp: TypeId) {
+        self.event_loop.events[self.handle.id].expected_messages.insert(tp);
+    }
+    fn io_register_any(&mut self, io: Box<IoHolderAny>, interest: Ready, opts: PollOpt) -> Result<IoId> {
         let id = self.event_loop.ios.store(self.handle);
         let token = Token(id + TOKEN_SHIFT);
-        if let Err(err) = self.event_loop.poll.register(&io, token, interest, opts) {
+        if let Err(err) = self.event_loop.poll.register(io.io(), token, interest, opts) {
             // If it fails, we want to get rid of the stored io first before returning the error
             self.event_loop.ios.release(id);
             return Err(Error::Io(err))
         }
-        self.event_loop.events[self.handle.id].ios.insert(id, Box::new(IoHolder {
-            recipient: self.handle,
-            io: io
-        }));
+        self.event_loop.events[self.handle.id].ios.insert(id, io);
         Ok(IoId(token))
     }
     fn io_update(&mut self, id: IoId, interest: Ready, opts: PollOpt) -> Result<()> {
@@ -1586,67 +1665,22 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
         self.event_loop.poll.deregister(io.io()).map_err(Error::Io)
         // TODO: Find a way to return the thing?
     }
-    fn with_io<E: Evented + 'static, R, F: FnOnce(&mut E) -> Result<R>>(&mut self, id: IoId, f: F) -> Result<R> {
+    fn io_mut(&mut self, id: IoId) -> Result<&mut Box<IoHolderAny>> {
         let idx = self.io_idx(id)?;
-        // Madness to get the real type of the object
-        let io: &mut IoHolder<E> = self.event_loop.events[self.handle.id].ios.get_mut(&idx).unwrap().as_any_mut().downcast_mut().ok_or(Error::IoType)?;
-        f(&mut io.io)
+        Ok(self.event_loop.events[self.handle.id].ios.get_mut(&idx).unwrap())
     }
-    fn idle(&mut self) {
-        self.event_loop.want_idle.insert(self.handle, ());
-    }
-    fn expect_message<T: Any + 'static>(&mut self) {
-        self.event_loop.events[self.handle.id].expected_messages.insert(TypeId::of::<T>());
-    }
-    fn background<R: Any + 'static + Send, F: 'static + Send + FnOnce() -> Result<R>>(&mut self, f: F) -> Result<BackgroundId> {
-        let (id, mut task) = self.background_task::<R, F, R>(f);
+    fn background_submit(&mut self, task: Box<TaskWrapper>) -> Result<BackgroundId> {
+        if self.event_loop.threadpool.is_none() {
+            self.event_loop.pool_thread_count_set(1);
+        }
+        let id = BackgroundId(self.event_loop.background_generation.0);
+        self.event_loop.background_generation += Wrapping(1);
+        let sender = self.event_loop.sender.clone();
+        let mut task: Box<_> = task;
         self.event_loop.threadpool.as_mut().unwrap().execute(move || {
-            let result = (task.task.take().unwrap())();
-            // And send the result (ignore if there's no recipient, then we're just done).
-            let _ = task.sender.send(RemoteMessage {
-                recipient: task.requestor,
-                data: Box::new(result),
-                real_type: TypeId::of::<R>(),
-                mode: DeliveryMode::Background(task.id),
-            });
-            // Good, completed without panic. Disarm the Drop trait there.
-            task.complete = true;
+            task.call(id, sender);
         });
         Ok(id)
-    }
-    fn background_iter<R: Any + 'static + Send, I: 'static + Iterator<Item = R>, F: 'static + Send + FnOnce() -> Result<I>>(&mut self, f: F) -> Result<BackgroundId> {
-        let (id, mut task) = self.background_task::<I, F, R>(f);
-        self.event_loop.threadpool.as_mut().unwrap().execute(move || {
-            let fun = task.task.take().unwrap();
-            let result = fun();
-            { // Block, so send gets destroyed soon enough
-                let send = |value: Result<R>| {
-                    let _ = task.sender.send(RemoteMessage {
-                        recipient: task.requestor,
-                        data: Box::new(value),
-                        real_type: TypeId::of::<R>(),
-                        mode: DeliveryMode::Background(task.id),
-                    });
-                };
-                match result {
-                    Ok(iter) => {
-                        for val in iter {
-                            send(Ok(val));
-                        }
-                        send(Err(Error::IterEnd));
-                    },
-                    Err(err) => send(Err(err)),
-                }
-            }
-            task.complete = true;
-        });
-        Ok(id)
-    }
-    fn signal(&mut self, signal: Signal) -> Result<()> {
-        self.event_loop.signal_enable(signal)?;
-        let signum = signal as i32;
-        self.event_loop.signal_recipients.entry(signum).or_insert(HashSet::new()).insert(self.handle);
-        Ok(())
     }
     fn child(&mut self, pid: pid_t) -> Result<()> {
         self.event_loop.signal_enable(Signal::SIGCHLD)?;
@@ -1656,6 +1690,8 @@ impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, L
         Ok(())
     }
 }
+
+impl<'a, Context, Ev: Event<Context, Ev>> Scope<Context, Ev> for LoopScope<'a, Loop<Context, Ev>> {}
 
 #[cfg(test)]
 mod tests {
@@ -1726,9 +1762,9 @@ mod tests {
 
     impl<C> Event<C, Recipient> for Recipient {
         fn init<S: Scope<C, Recipient>>(&mut self, scope: &mut S) -> Response {
-            scope.expect_message::<()>();
-            scope.expect_message::<Rc<Recurse>>();
-            scope.expect_message::<SendB>();
+            scope.expect_message(TypeId::of::<()>());
+            scope.expect_message(TypeId::of::<Rc<Recurse>>());
+            scope.expect_message(TypeId::of::<SendB>());
             // Stay alive for now
             Ok(true)
         }
@@ -1818,7 +1854,7 @@ mod tests {
 
     impl Event<(), RemoteRecipient> for RemoteRecipient {
         fn init<S: Scope<(), RemoteRecipient>>(&mut self, scope: &mut S) -> Response {
-            scope.expect_message::<RemoteHello>();
+            scope.expect_message(TypeId::of::<RemoteHello>());
             Ok(true)
         }
         fn message<S: Scope<(), RemoteRecipient>>(&mut self, _scope: &mut S, message: Message) -> Response {
