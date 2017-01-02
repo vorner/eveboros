@@ -200,29 +200,46 @@ impl<Context> SelfDynEvent<Context> {
     }
 }
 
-impl<Context> Event<Context, SelfDynEvent<Context>> for SelfDynEvent<Context> {
-    fn init<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S) -> Response {
-        self.0.init(scope)
-    }
-    fn io<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
-        self.0.io(scope, id, ready)
-    }
-    fn timeout<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S, id: TimeoutId) -> Response {
-        self.0.timeout(scope, id)
-    }
-    fn signal<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S, signal: Signal) -> Response {
-        self.0.signal(scope, signal)
-    }
-    fn idle<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S) -> Response {
-        self.0.idle(scope)
-    }
-    fn message<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S, msg: Message) -> Response {
-        self.0.message(scope, msg)
-    }
-    fn child<S: Scope<Context, SelfDynEvent<Context>>>(&mut self, scope: &mut S, pid: pid_t, exit: ChildExit) -> Response {
-        self.0.child(scope, pid, exit)
+// Reuse the same implementation for SelfDynEvent and AnyDynEvent
+macro_rules! dyn_event {
+    ( $tp: ty, $ev: ty, $( $param: ident ),+ ) => {
+        impl<$( $param ),+> Event<Context, $ev> for $tp {
+            fn init<S: Scope<Context, $ev>>(&mut self, scope: &mut S) -> Response {
+                self.0.init(scope)
+            }
+            fn io<S: Scope<Context, $ev>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
+                self.0.io(scope, id, ready)
+            }
+            fn timeout<S: Scope<Context, $ev>>(&mut self, scope: &mut S, id: TimeoutId) -> Response {
+                self.0.timeout(scope, id)
+            }
+            fn signal<S: Scope<Context, $ev>>(&mut self, scope: &mut S, signal: Signal) -> Response {
+                self.0.signal(scope, signal)
+            }
+            fn idle<S: Scope<Context, $ev>>(&mut self, scope: &mut S) -> Response {
+                self.0.idle(scope)
+            }
+            fn message<S: Scope<Context, $ev>>(&mut self, scope: &mut S, msg: Message) -> Response {
+                self.0.message(scope, msg)
+            }
+            fn child<S: Scope<Context, $ev>>(&mut self, scope: &mut S, pid: pid_t, exit: ChildExit) -> Response {
+                self.0.child(scope, pid, exit)
+            }
+        }
     }
 }
+
+dyn_event!(SelfDynEvent<Context>, SelfDynEvent<Context>, Context );
+
+pub struct AnyDynEvent<Context, Ev>(Box<WrappedEvent<Context, Ev>>);
+
+impl<Context, OuterEvent> AnyDynEvent<Context, OuterEvent> {
+    pub fn new<InnerEvent: Event<Context, OuterEvent> + 'static>(ev: InnerEvent) -> Self {
+        AnyDynEvent(Box::new(EventWrapper(ev)))
+    }
+}
+
+dyn_event!(AnyDynEvent<Context, Ev>, Ev, Context, Ev );
 
 struct DynScope<'a, Context: 'a, ScopeEv: 'a>(&'a mut ScopeObjSafe<Context, ScopeEv>);
 
@@ -289,13 +306,58 @@ mod tests {
         }
     }
 
-    /// Put two different events in the same loop.
+    combined!(IdleTimeout, bool,
+        T(TimeoutEvent),
+        I(IdleEvent),
+    );
+
+    /// Put two different events into the same loop,
+    #[test]
+    fn static_event() {
+        let mut l: Loop<bool, IdleTimeout> = Loop::new(false).unwrap();
+        l.insert(IdleEvent).unwrap();
+        l.insert(TimeoutEvent).unwrap();
+        l.run().unwrap();
+        l.with_context(|ctx| {
+            assert!(*ctx);
+            Ok(())
+        }).unwrap();
+        assert_eq!(0, l.event_count());
+    }
+
+    /// Put two different events into the same loop, composed dynamically
     #[test]
     fn dyn_event() {
         let mut l: Loop<bool, SelfDynEvent<bool>> = Loop::new(false).unwrap();
         l.insert(SelfDynEvent::new(IdleEvent)).unwrap();
         l.insert(SelfDynEvent::new(TimeoutEvent)).unwrap();
         l.run().unwrap();
+        l.with_context(|ctx| {
+            assert!(*ctx);
+            Ok(())
+        }).unwrap();
         assert_eq!(0, l.event_count());
     }
+
+    combined!(Both, bool,
+        D(AnyDynEvent<bool, Both>),
+    );
+
+    /**
+     * Put both compositions into play (this may make sense if there was another
+     * statically-dispatched event, this version is of little use but for testing).
+     */
+    #[test]
+    fn both_events() {
+        let mut l: Loop<bool, Both> = Loop::new(false).unwrap();
+        l.insert(AnyDynEvent::new(IdleEvent)).unwrap();
+        l.insert(AnyDynEvent::new(TimeoutEvent)).unwrap();
+        l.run().unwrap();
+        l.with_context(|ctx| {
+            assert!(*ctx);
+            Ok(())
+        }).unwrap();
+        assert_eq!(0, l.event_count());
+    }
+
 }
