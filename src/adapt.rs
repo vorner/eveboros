@@ -1,10 +1,40 @@
-/**
+/*!
  * Useful utilities to combine events together in various ways.
+ *
+ * # Side by side composition
+ *
+ * The [Loop](../struct.Loop.html) allows only one kind of [Event](../trait.Event.html) to be
+ * inserted. In the real world, multiple different kinds are usually needed. We therefore provide
+ * ways to compose multiple event types into one that can be inserted.
+ *
+ * Using the [combined](../macro.combined.html) macro (due to the macro limitations, it lives in
+ * the root module of the crate), you can create an statically-dispatched event. It is basically an
+ * enum with one variant per the real event. It uses `match` to decide which function gets called.
+ *
+ * There are also the [SelfDynEvent](struct.SelfDynEvent.html) and
+ * [AnyDynEvent](struct.AnyDynEvent.html). These use dynamic dispatch through trait objects.
+ *
+ * The static approach provides better performance, since the compiler knows what methods get
+ * called and can inline them. On the other hand, dynamic dispatch allows one piece of code be
+ * oblivious of all the types other pieces of code might want to use. Also, if there's one large
+ * variant in the enum, all the composite events will be this large even though it might be a waste
+ * for the rest of the events.
+ *
+ * You can also combine the approaches. The top-level composition would be the static one and it
+ * would combine the performance sensitive and known event types. In addition, it would contain one
+ * dynamic event option, where all the unknown, performance insensitive or very large events would
+ * go.
  */
 
-pub use mio::{Ready,PollOpt};
-pub use libc::pid_t;
-pub use nix::sys::signal::Signal;
+/// Some symbols re-exported from other crates, for macro use.
+pub mod reexports {
+    pub use mio::Ready;
+    pub use libc::pid_t;
+    pub use nix::sys::signal::Signal;
+}
+
+use self::reexports::*;
+use mio::PollOpt;
 use std::any::{Any,TypeId};
 use std::time::Instant;
 use super::*;
@@ -20,7 +50,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.init(scope), )+
                 }
             }
-            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: Ready) -> Response {
+            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::adapt::reexports::Ready) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.io(scope, id, ready), )+
                 }
@@ -30,7 +60,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.timeout(scope, id), )+
                 }
             }
-            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: Signal) -> Response {
+            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::adapt::reexports::Signal) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.signal(scope, signal), )+
                 }
@@ -45,7 +75,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.message(scope, msg), )+
                 }
             }
-            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: pid_t, exit: ChildExit) -> Response {
+            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::adapt::reexports::pid_t, exit: ChildExit) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.child(scope, pid, exit), )+
                 }
@@ -67,6 +97,9 @@ macro_rules! combined_impl {
  * This macro creates an enum event that is a choice between several other sub-events. The dispatch
  * is static (using a `match` statement). For now, it can generate only a concrete final event (it
  * can't be type-parametrized for now).
+ *
+ * If you don't know what events you want to compose in advance, you may use
+ * [SelfDynEvent](adapt/struct.SelfDynEvent.html) or [AnyDynEvent](adapt/struct.AnyDynEvent.html).
  *
  * # Examples
  *
@@ -265,8 +298,8 @@ dyn_event!(SelfDynEvent<Context>, SelfDynEvent<Context>, Context );
  *
  * It is basically the same as [SelfDynEvent](struct.SelfDynEvent.html), but this one allows the
  * loop's event to be different. It may be useful if you want to have some events dispatched
- * statically (through the [compose](../macro.compose.html) macro) statically for performance, but
- * allow for the flexibility of dynamically dispatched events.
+ * statically (through the [compose](../macro.compose.html) macro) for performance, but allow for
+ * the flexibility of dynamically dispatched events.
  */
 pub struct AnyDynEvent<Context, Ev>(Box<WrappedEvent<Context, Ev>>);
 
