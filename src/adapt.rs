@@ -192,9 +192,38 @@ impl<Context, Ev, ScopeEvent> WrappedEvent<Context, ScopeEvent> for EventWrapper
     }
 }
 
+/**
+ * A dynamic dispatch event wrapper.
+ *
+ * This allows to wrap any event into the same kind of object. It allows to have a
+ * [Loop](../struct.Loop.html) and plug events of potentionally unknown types into it.
+ * Obviously, at the cost of dynamic dispatch when calling the callbacks.
+ *
+ * It is basically the same as [AnyDynEvent](struct.AnyDynEvent.html), except this one is for the
+ * situation it is the main event (it would be impossible to create the correct type because of
+ * cyclic types).
+ *
+ * # Examples
+ *
+ * ```
+ * use eveboros::*;
+ * use eveboros::adapt::*;
+ *
+ * struct UselessEvent;
+ * impl<Context, Ev> Event<Context, Ev> for UselessEvent {
+ *     fn init<S: Scope<Context, Ev>>(&mut self, _scope: &mut S) -> Response {
+ *         Ok(true)
+ *     }
+ * }
+ *
+ * let mut l: Loop<(), SelfDynEvent<()>> = Loop::new(()).unwrap();
+ * l.insert(SelfDynEvent::new(UselessEvent)).unwrap();
+ * ```
+ */
 pub struct SelfDynEvent<Context>(Box<WrappedEvent<Context, SelfDynEvent<Context>>>);
 
 impl<Context> SelfDynEvent<Context> {
+    /// Wrap another event into this one.
     pub fn new<Ev: Event<Context, SelfDynEvent<Context>> + 'static>(ev: Ev) -> Self {
         SelfDynEvent(Box::new(EventWrapper(ev)))
     }
@@ -231,9 +260,18 @@ macro_rules! dyn_event {
 
 dyn_event!(SelfDynEvent<Context>, SelfDynEvent<Context>, Context );
 
+/**
+ * A dynamic dispatch event wrapper.
+ *
+ * It is basically the same as [SelfDynEvent](struct.SelfDynEvent.html), but this one allows the
+ * loop's event to be different. It may be useful if you want to have some events dispatched
+ * statically (through the [compose](../macro.compose.html) macro) statically for performance, but
+ * allow for the flexibility of dynamically dispatched events.
+ */
 pub struct AnyDynEvent<Context, Ev>(Box<WrappedEvent<Context, Ev>>);
 
 impl<Context, OuterEvent> AnyDynEvent<Context, OuterEvent> {
+    /// Wrap another event into this one.
     pub fn new<InnerEvent: Event<Context, OuterEvent> + 'static>(ev: InnerEvent) -> Self {
         AnyDynEvent(Box::new(EventWrapper(ev)))
     }
