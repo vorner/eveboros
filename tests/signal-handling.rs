@@ -11,12 +11,12 @@ extern crate libc;
  * (without running the rest of the tests). But that's enough for this.
  */
 
-use eveboros::{Loop,Event,Scope,Response,ChildExit,LoopIface,LoopIfaceObjSafe};
-use nix::sys::signal::{raise,Signal};
-use nix::unistd::{ForkResult,fork};
+use eveboros::{Loop, Event, Scope, Response, ChildExit, LoopIface, LoopIfaceObjSafe};
+use nix::sys::signal::{raise, Signal};
+use nix::unistd::{ForkResult, fork};
 use libc::pid_t;
 use std::process::exit;
-use std::panic::{catch_unwind,set_hook,take_hook};
+use std::panic::{catch_unwind, set_hook, take_hook};
 
 /// Thing that terminates once the correct signal is received
 struct SigRecipient(Signal);

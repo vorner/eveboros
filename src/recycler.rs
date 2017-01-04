@@ -1,55 +1,48 @@
-/*!
- * Something like the slab allocator, but can grow when there's not enough space.
- */
-use std::ops::{Index,IndexMut};
+//! Something like the slab allocator, but can grow when there's not enough space.
+//!
+use std::ops::{Index, IndexMut};
 
-/**
- * An allocator for one type of object. Or, well, allocator… you store things into it, so it's not
- * strictly an allocator, more like a storage.
- *
- * Each item has an index that stays the same for the whole life of the item. It may get reused
- * once the item is released.
- *
- * It asserts that `release()`d items are not accessed or released again.
- *
- * # Examples
- *
- * [//]: # Not-compiled example, as rustdoc has problems with examples for private pieces of code.
- *
- * ```rust,ignore
- * let mut r: Recycler<u32> = Recycler::new();
- * let idx1: usize = s.store(1);
- * let idx2: usize = s.store(2);
- *
- * assert_eq!(1, s[idx1]);
- * assert_eq!(2, s[idx2]);
- * assert_eq!(2, s.len());
- *
- * s[idx1] = 3;
- *
- * assert_eq!(3, s[idx3]);
- *
- * s.release(idx1);
- *
- * assert_eq!(1, s.len());
- *
- * // s[idx1]; -- this is no longer valid (and is checked inside by an assert)
- *
- * let idx3: usize = s.store(4); // May reuse the same index as idx1
- * ```
- */
+/// An allocator for one type of object. Or, well, allocator… you store things into it, so it's not
+/// strictly an allocator, more like a storage.
+///
+/// Each item has an index that stays the same for the whole life of the item. It may get reused
+/// once the item is released.
+///
+/// It asserts that `release()`d items are not accessed or released again.
+///
+/// # Examples
+///
+/// [//]: # Not-compiled example, as rustdoc has problems with examples for private pieces of code.
+///
+/// ```rust,ignore
+/// let mut r: Recycler<u32> = Recycler::new();
+/// let idx1: usize = s.store(1);
+/// let idx2: usize = s.store(2);
+///
+/// assert_eq!(1, s[idx1]);
+/// assert_eq!(2, s[idx2]);
+/// assert_eq!(2, s.len());
+///
+/// s[idx1] = 3;
+///
+/// assert_eq!(3, s[idx3]);
+///
+/// s.release(idx1);
+///
+/// assert_eq!(1, s.len());
+///
+/// // s[idx1]; -- this is no longer valid (and is checked inside by an assert)
+///
+/// let idx3: usize = s.store(4); // May reuse the same index as idx1
+/// ```
 pub struct Recycler<T> {
-    /**
-     * The actual storage where items live.
-     *
-     * The live slots have Some(T), while the currently unused ones have None. This is to
-     * sanity-check indexing and releasing of the items by user.
-     */
+    /// The actual storage where items live.
+    ///
+    /// The live slots have Some(T), while the currently unused ones have None. This is to
+    /// sanity-check indexing and releasing of the items by user.
     data: Vec<Option<T>>,
-    /**
-     * Indexes of currently unused slots, used as a stack (we don't care about the order and it's
-     * the fastest operation on Vec).
-     */
+    /// Indexes of currently unused slots, used as a stack (we don't care about the order and it's
+    /// the fastest operation on Vec).
     free: Vec<usize>,
 }
 
@@ -58,7 +51,7 @@ impl<T> Recycler<T> {
     pub fn new() -> Self {
         Recycler {
             data: Vec::new(),
-            free: Vec::new()
+            free: Vec::new(),
         }
     }
 
@@ -70,20 +63,18 @@ impl<T> Recycler<T> {
                 assert!(ptr.is_none());
                 *ptr = Some(item);
                 idx
-            }
+            },
             None => {
                 self.data.push(Some(item));
                 self.data.len() - 1
-            }
+            },
         }
     }
 
-    /**
-     * Return the item at the given index. The index is not valid until the storage retuns it for
-     * another newly stored item.
-     *
-     * The old content is returned.
-     */
+    /// Return the item at the given index. The index is not valid until the storage retuns it for
+    /// another newly stored item.
+    ///
+    /// The old content is returned.
     pub fn release(&mut self, idx: usize) -> T {
         let ptr = &mut self.data[idx];
         assert!(ptr.is_some());
@@ -96,18 +87,14 @@ impl<T> Recycler<T> {
         idx < self.data.len() && self.data[idx].is_some()
     }
 
-    /**
-     * How many items can be held without reallocation. Note that the reallocation happens
-     * automatically.
-     */
+    /// How many items can be held without reallocation. Note that the reallocation happens
+    /// automatically.
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
-    /**
-     * How many items are there stored?
-     */
+    /// How many items are there stored?
     pub fn len(&self) -> usize {
         self.data.len() - self.free.len()
     }
