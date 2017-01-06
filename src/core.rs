@@ -232,6 +232,15 @@ pub trait LoopIfaceObjSafe<Context, Ev> {
     /// Run the event loop until someone calls [stop](#tymethod.stop). If all the events inside the
     /// loop terminate, the [Error::Empty](error/enum.Error.html) error is returned.
     fn run(&mut self) -> Result<()>;
+    /// Run the event loop until it is empty of events or stopped.
+    ///
+    /// Run the event loop and stop when it gets empty or when stop is called explicitly.
+    fn run_until_empty(&mut self) -> Result<()> {
+        match self.run() {
+            Err(Error::Empty) => Ok(()), // We actually want that
+            r => r,
+        }
+    }
     /// Stop the event loop.
     ///
     /// If the event loop was started by [run](#tymethod.run), stop it (once the current callback
@@ -537,7 +546,6 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> + ScopeObjSafe<Context, Ev>
     /// # extern crate mio;
     /// # extern crate eveboros;
     /// use eveboros::*;
-    /// use mio::{Ready,PollOpt};
     /// use mio::tcp::TcpStream;
     /// use std::io::Write;
     ///
@@ -1137,9 +1145,10 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             // No event waiting for it → throw it away
         };
         loop {
-            // Wait for any PId whatsoever, but don't block.
+            // Wait for any PID whatsoever, but don't block.
             match waitpid(-1, Some(WNOHANG)) {
                 Err(nix::Error::Sys(Errno::EAGAIN)) => return Ok(()), // No more children terminated, done
+                Ok(WaitStatus::StillAlive) => return Ok(()), // No more children terminated, done
                 Err(nix::Error::Sys(Errno::ECHILD)) => return Ok(()), // There are no more children at all
                 Err(err) => return Err(Error::Nix(err)), // Propagate other errors
                 Ok(WaitStatus::Exited(pid, code)) => push(pid, ChildExit::Exited(code)),
@@ -1999,7 +2008,7 @@ mod tests {
         assert!(!l.event_alive(handle));
         // But if we try to run the loop long-term, it complains it is empty
         l.insert(ErrorTimeout).unwrap();
-        err!(l.run(), Error::Empty);
+        l.run_until_empty().unwrap();
     }
 
     struct Listener;

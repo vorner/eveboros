@@ -24,15 +24,6 @@
 //! dynamic event option, where all the unknown, performance insensitive or very large events would
 //! go.
 
-/// Some symbols re-exported from other crates, for macro use.
-pub mod reexports {
-    pub use mio::Ready;
-    pub use libc::pid_t;
-    pub use nix::sys::signal::Signal;
-}
-
-use self::reexports::*;
-use mio::PollOpt;
 use std::any::{Any, TypeId};
 use std::time::Instant;
 use super::*;
@@ -48,7 +39,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.init(scope), )+
                 }
             }
-            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::adapt::reexports::Ready) -> Response {
+            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::Ready) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.io(scope, id, ready), )+
                 }
@@ -58,7 +49,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.timeout(scope, id), )+
                 }
             }
-            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::adapt::reexports::Signal) -> Response {
+            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::Signal) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.signal(scope, signal), )+
                 }
@@ -73,7 +64,7 @@ macro_rules! combined_impl {
                     $( &mut $name :: $subname ( ref mut val ) => val.message(scope, msg), )+
                 }
             }
-            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::adapt::reexports::pid_t, exit: ChildExit) -> Response {
+            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::pid_t, exit: ChildExit) -> Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.child(scope, pid, exit), )+
                 }

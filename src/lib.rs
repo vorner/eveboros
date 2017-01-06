@@ -88,7 +88,6 @@
 //! extern crate mio;
 //!
 //! use eveboros::*;
-//! use mio::{Ready,PollOpt};
 //! use mio::tcp::{TcpStream,TcpListener};
 //! use std::io::Write;
 //! use std::time::Duration;
@@ -139,6 +138,11 @@ extern crate linked_hash_map;
 extern crate threadpool;
 extern crate nix;
 extern crate libc;
+
+// Some reexported types we use in our interfaces
+pub use mio::{Ready, PollOpt};
+pub use libc::pid_t;
+pub use nix::sys::signal::Signal;
 
 pub mod error;
 pub mod adapt;
