@@ -120,38 +120,38 @@ macro_rules! combined {
         combined!( impl $name, $context, $( $subname ($sub), )+);
     };
     ( impl $name: ident, $context: ty, $( $subname: ident ( $sub: ty ), )+ ) => {
-        impl Event<$context, $name> for $name {
-            fn init<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
+        impl $crate::Event<$context, $name> for $name {
+            fn init<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.init(scope), )+
                 }
             }
-            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::Ready) -> Response {
+            fn io<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S, id: $crate::IoId, ready: $crate::Ready) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.io(scope, id, ready), )+
                 }
             }
-            fn timeout<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: TimeoutId) -> Response {
+            fn timeout<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S, id: $crate::TimeoutId) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.timeout(scope, id), )+
                 }
             }
-            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::Signal) -> Response {
+            fn signal<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::Signal) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.signal(scope, signal), )+
                 }
             }
-            fn idle<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
+            fn idle<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.idle(scope), )+
                 }
             }
-            fn message<S: Scope<$context, $name>>(&mut self, scope: &mut S, msg: Message) -> Response {
+            fn message<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S, msg: $crate::Message) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.message(scope, msg), )+
                 }
             }
-            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::pid_t, exit: ChildExit) -> Response {
+            fn child<S: $crate::Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::pid_t, exit: $crate::ChildExit) -> $crate::Response {
                 match self {
                     $( &mut $name :: $subname ( ref mut val ) => val.child(scope, pid, exit), )+
                 }
@@ -159,7 +159,7 @@ macro_rules! combined {
         }
 
         $(
-        impl From<$sub> for $name {
+        impl ::std::convert::From<$sub> for $name {
             fn from(val: $sub) -> $name { $name :: $subname (val) }
         }
         )+
