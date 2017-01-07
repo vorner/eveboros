@@ -29,57 +29,6 @@ use std::time::Instant;
 use super::*;
 use super::error::*;
 
-/// Part of [combined](macro.combined.html) macro implementation
-#[macro_export]
-macro_rules! combined_impl {
-    ( $name: ident, $context: ty, $( $subname: ident ( $sub: ty ), )+ ) => {
-        impl Event<$context, $name> for $name {
-            fn init<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.init(scope), )+
-                }
-            }
-            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::Ready) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.io(scope, id, ready), )+
-                }
-            }
-            fn timeout<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: TimeoutId) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.timeout(scope, id), )+
-                }
-            }
-            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::Signal) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.signal(scope, signal), )+
-                }
-            }
-            fn idle<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.idle(scope), )+
-                }
-            }
-            fn message<S: Scope<$context, $name>>(&mut self, scope: &mut S, msg: Message) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.message(scope, msg), )+
-                }
-            }
-            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::pid_t, exit: ChildExit) -> Response {
-                match self {
-                    $( &mut $name :: $subname ( ref mut val ) => val.child(scope, pid, exit), )+
-                }
-            }
-        }
-
-        $(
-        impl From<$sub> for $name {
-            fn from(val: $sub) -> $name { $name :: $subname (val) }
-        }
-        )+
-    };
-}
-
-
 /// This allows combining events statically side by side.
 ///
 /// This macro creates an enum event that is a choice between several other sub-events. The dispatch
@@ -92,7 +41,7 @@ macro_rules! combined_impl {
 /// # Examples
 ///
 /// ```
-/// #[macro_use]
+/// #[macro_use(combined)]
 /// extern crate eveboros;
 ///
 /// use eveboros::*;
@@ -162,13 +111,58 @@ macro_rules! combined {
         pub enum $name {
             $( $subname($sub), )+
         }
-        combined_impl!( $name, $context, $( $subname ($sub), )+);
+        combined!( impl $name, $context, $( $subname ($sub), )+);
     };
     ( $name: ident, $context: ty, $( $subname: ident ( $sub: ty ), )+ ) => {
         enum $name {
             $( $subname($sub), )+
         }
-        combined_impl!( $name, $context, $( $subname ($sub), )+);
+        combined!( impl $name, $context, $( $subname ($sub), )+);
+    };
+    ( impl $name: ident, $context: ty, $( $subname: ident ( $sub: ty ), )+ ) => {
+        impl Event<$context, $name> for $name {
+            fn init<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.init(scope), )+
+                }
+            }
+            fn io<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: IoId, ready: $crate::Ready) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.io(scope, id, ready), )+
+                }
+            }
+            fn timeout<S: Scope<$context, $name>>(&mut self, scope: &mut S, id: TimeoutId) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.timeout(scope, id), )+
+                }
+            }
+            fn signal<S: Scope<$context, $name>>(&mut self, scope: &mut S, signal: $crate::Signal) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.signal(scope, signal), )+
+                }
+            }
+            fn idle<S: Scope<$context, $name>>(&mut self, scope: &mut S) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.idle(scope), )+
+                }
+            }
+            fn message<S: Scope<$context, $name>>(&mut self, scope: &mut S, msg: Message) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.message(scope, msg), )+
+                }
+            }
+            fn child<S: Scope<$context, $name>>(&mut self, scope: &mut S, pid: $crate::pid_t, exit: ChildExit) -> Response {
+                match self {
+                    $( &mut $name :: $subname ( ref mut val ) => val.child(scope, pid, exit), )+
+                }
+            }
+        }
+
+        $(
+        impl From<$sub> for $name {
+            fn from(val: $sub) -> $name { $name :: $subname (val) }
+        }
+        )+
     };
 }
 
