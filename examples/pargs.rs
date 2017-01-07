@@ -7,6 +7,7 @@ extern crate eveboros;
 
 use std::env::args;
 use std::io::{Write, BufRead, stderr};
+
 use eveboros::error::{Error, Result};
 use eveboros::{Loop, Event, Response, Scope, LoopIfaceObjSafe, LoopIface, ChildExit, pid_t};
 
@@ -31,12 +32,7 @@ struct Runner(Option<String>);
 
 impl Runner {
     fn run<'a, Ev, S: Scope<Context<'a>, Ev>>(&mut self, scope: &mut S) -> Response {
-        let mut cmd = None;
-        scope.with_context(|ctx| {
-                cmd = ctx.commands.next();
-                Ok(())
-            })?;
-        match cmd {
+        match scope.with_context(|ctx| Ok(ctx.commands.next()))? {
             None => Ok(false), // No more commands to run, terminate
             Some(Err(e)) => Err(e.into()), // Propagate the error from stdin
             Some(Ok(cmd)) => {

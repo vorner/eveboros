@@ -364,7 +364,7 @@ pub trait LoopIface<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     ///     }).unwrap();
     /// }
     /// ```
-    fn with_context<F: FnOnce(&mut Context) -> Result<()>>(&mut self, f: F) -> Result<()> {
+    fn with_context<R, F: FnOnce(&mut Context) -> Result<R>>(&mut self, f: F) -> Result<R> {
         f(self.context())
     }
     /// Send some data to the event asynchronously.
@@ -558,7 +558,7 @@ pub trait Scope<Context, Ev>: LoopIface<Context, Ev> + ScopeObjSafe<Context, Ev>
     ///         Ok(true)
     ///     }
     ///     fn io<S: Scope<Context, AnyEv>>(&mut self, scope: &mut S, io: IoId, _ready: Ready) -> Response {
-    ///        // Try sending password.
+    ///         // Try sending password.
     ///         scope.with_io(io, |stream: &mut TcpStream| {
     ///             write!(stream, "root\nroot\n").unwrap();
     ///             Ok(())
@@ -972,10 +972,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         poll.register(&receiver, CHANNEL_TOK, Ready::readable(), PollOpt::empty())?;
         let signal_mask = SigSet::empty();
         let signal_fd = SignalFd::with_flags(&signal_mask, SFD_CLOEXEC | SFD_NONBLOCK)?;
-        poll.register(&EventedFd(&signal_fd.as_raw_fd()),
-                      SIGNAL_TOK,
-                      Ready::readable(),
-                      PollOpt::empty())?;
+        poll.register(&EventedFd(&signal_fd.as_raw_fd()), SIGNAL_TOK, Ready::readable(), PollOpt::empty())?;
         Ok(Loop {
             poll: poll,
             mio_events: Events::with_capacity(1024),
@@ -1622,10 +1619,7 @@ impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScop
         let idx = self.io_idx(id)?;
         self.event_loop
             .poll
-            .reregister(self.event_loop.events[self.handle.id].ios[&idx].io(),
-                        id.0,
-                        interest,
-                        opts)
+            .reregister(self.event_loop.events[self.handle.id].ios[&idx].io(), id.0, interest, opts)
             .map_err(Error::Io)
     }
     fn io_remove(&mut self, id: IoId) -> Result<()> {
@@ -2036,8 +2030,7 @@ mod tests {
                     writeln!(stream, "hello").map_err(Error::Io)
                 })?;
             scope.io_remove(id)?;
-            err!(scope.io_update(id, Ready::writable(), PollOpt::empty()),
-                 Error::MissingIo);
+            err!(scope.io_update(id, Ready::writable(), PollOpt::empty()), Error::MissingIo);
             scope.stop();
             Ok(true)
         }
