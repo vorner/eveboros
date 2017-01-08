@@ -1,19 +1,5 @@
 // TODO: Some logging
 
-use super::recycler::Recycler;
-use error::{Result, Error};
-use stolen_cell::StolenCell;
-use mio::{Poll, Events, Token, Ready, Evented, PollOpt};
-use mio::channel::{Receiver, Sender, channel, SendError};
-use mio::unix::EventedFd;
-use linked_hash_map::LinkedHashMap;
-use threadpool::ThreadPool;
-use nix::sys::signal::{SigSet, Signal};
-use nix::sys::signalfd::{SignalFd, SFD_CLOEXEC, SFD_NONBLOCK};
-use nix::sys::wait::{WaitStatus, waitpid, WNOHANG};
-use nix::Errno;
-use nix;
-use libc::pid_t;
 use std::num::Wrapping;
 use std::any::Any;
 use std::collections::{VecDeque, BinaryHeap, HashSet, HashMap};
@@ -26,20 +12,22 @@ use std::any::TypeId;
 use std::sync::mpsc::TryRecvError;
 use std::os::unix::io::AsRawFd;
 
-/// An opaque handle for event's IO
-#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
-pub struct IoId(Token);
+use mio::{Poll, Events, Token, Ready, Evented, PollOpt};
+use mio::channel::{Receiver, Sender, channel, SendError};
+use mio::unix::EventedFd;
+use linked_hash_map::LinkedHashMap;
+use threadpool::ThreadPool;
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::{SignalFd, SFD_CLOEXEC, SFD_NONBLOCK};
+use nix::sys::wait::{WaitStatus, waitpid, WNOHANG};
+use nix::Errno;
+use nix;
+use libc::pid_t;
 
-/// An opaque handle for event's timer
-#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
-pub struct TimeoutId(u64);
-
-/// An opaque handle for an event
-#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
-pub struct Handle {
-    id: usize,
-    generation: u64,
-}
+use super::{IoId, TimeoutId, Handle};
+use recycler::Recycler;
+use error::{Result, Error};
+use stolen_cell::StolenCell;
 
 /// A thread-safe channel to notify events.
 ///
@@ -781,7 +769,6 @@ struct EvHolder<Event> {
     // inside the loop), we need to cheat the borrow checker a bit. The original solution of having
     // Option<Event> and taking it out and then returning it back worked, but was clumsy. This way
     // we pretend to take it out and back, but without the actual taking and returning.
-    //
     event: StolenCell<Event>,
     generation: u64,
     // How many timeouts does it have?
@@ -925,7 +912,6 @@ pub struct Loop<Context, Ev> {
     // We try to detect referring to an event with Handle from event that had the same index as us
     // and the index got reused by adding generation to the event. It is very unlikely we would
     // hit the very same index and go through all 2^64 iterations to cause hitting a collision.
-    //
     generation: Wrapping<u64>,
     // Preparsed events we received from mio and other sources, ready to be dispatched one by one
     scheduled: VecDeque<Task>,
@@ -934,7 +920,6 @@ pub struct Loop<Context, Ev> {
     //
     // We don't remove timeouts of killed events right away, we ignore them when they fire.
     // However, when there's more dead ones than live ones, we go through it whole and prune them.
-    //
     timeouts: BinaryHeap<TimeoutHolder>,
     // How many were dropped because of dying event?
     timeouts_dead: usize,
@@ -1666,6 +1651,7 @@ impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScop
 mod tests {
     use super::*;
     use ::error::*;
+    use ::{TimeoutId, IoId};
     use mio::tcp::{TcpListener, TcpStream};
     use mio::{Ready, PollOpt};
     use std::rc::Rc;

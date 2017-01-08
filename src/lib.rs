@@ -150,4 +150,20 @@ mod core;
 mod recycler;
 mod stolen_cell;
 
-pub use core::{IoId, TimeoutId, Handle, Channel, Message, BackgroundId, Loop, LoopIface, LoopIfaceObjSafe, Scope, ScopeObjSafe, Event, Response, DeliveryMode, ChildExit, IoHolderAny, TaskWrapper};
+pub use core::{Channel, Message, BackgroundId, Loop, LoopIface, LoopIfaceObjSafe, Scope, ScopeObjSafe, Event, Response, DeliveryMode, ChildExit, IoHolderAny, TaskWrapper};
+
+/// An opaque handle for event's IO
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
+pub struct IoId(::mio::Token);
+
+/// An opaque handle for event's timer
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
+pub struct TimeoutId(u64);
+
+/// An opaque handle for an event
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Ord,PartialOrd)]
+pub struct Handle {
+    id: usize,
+    generation: u64,
+}
+
