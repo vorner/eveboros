@@ -138,6 +138,8 @@ extern crate linked_hash_map;
 extern crate threadpool;
 extern crate nix;
 extern crate libc;
+#[macro_use]
+extern crate lazy_static;
 
 // Some reexported types we use in our interfaces
 pub use mio::{Ready, PollOpt};
@@ -149,6 +151,7 @@ pub mod adapt;
 mod core;
 mod recycler;
 mod stolen_cell;
+mod signal_dispatch;
 
 pub use core::{Channel, Message, BackgroundId, Loop, LoopIface, LoopIfaceObjSafe, Scope, ScopeObjSafe, Event, Response, DeliveryMode, ChildExit, IoHolderAny, TaskWrapper};
 
