@@ -26,8 +26,12 @@
 
 use std::any::{Any, TypeId};
 use std::time::Instant;
+use std::num::Wrapping;
+
 use super::*;
-use super::error::*;
+use error::*;
+use recycler::Recycler;
+use stolen_cell::StolenCell;
 
 /// This allows combining events statically side by side.
 ///
@@ -367,6 +371,75 @@ impl<'a, Context, ScopeEv> ScopeObjSafe<Context, ScopeEv> for DynScope<'a, Conte
     }
 }
 
+struct EvHolder<Event> {
+    // Similar to the main Loop, we need to pass both the event and us as mutable,
+    // so we shall „lock“ and steal the event when it is called.
+    event: StolenCell<Event>,
+    generation: u64,
+}
+
+// TODO: How do we send the results back?
+pub enum ProxyControl<CtxInner, EvInner> {
+    Insert(EvInner),
+    WithProxy(Box<FnOnce(&mut LoopIfaceObjSafe<CtxInner, EvInner>) -> Result<()>>),
+    Stop,
+}
+
+pub struct CtxProxy<CtxInner, EvInner> {
+    context: CtxInner,
+    events: Recycler<EvHolder<EvInner>>,
+    initialized: bool,
+    generation: Wrapping<u64>,
+}
+
+impl<CtxInner, EvInner> CtxProxy<CtxInner, EvInner> {
+    pub fn new(context: CtxInner) -> Self {
+        CtxProxy {
+            context: context,
+            events: Recycler::new(),
+            initialized: false,
+            generation: Wrapping(0),
+        }
+    }
+    pub fn preinsert(&mut self, ev: EvInner) -> Handle {
+        assert!(!self.initialized);
+        let gen = self.generation.0;
+        self.generation += Wrapping(1);
+        let idx = self.events.store(EvHolder {
+            event: StolenCell::new(ev),
+            generation: gen,
+        });
+        Handle {
+            id: idx,
+            generation: gen
+        }
+    }
+}
+
+impl<CtxOuter, EvOuter, CtxInner, EvInner> Event<CtxOuter, EvOuter> for CtxProxy<CtxInner, EvInner> {
+    fn init<S: Scope<CtxOuter, EvOuter>>(&mut self, scope: &mut S) -> Response {
+        unimplemented!();
+    }
+    fn io<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S, _id: IoId, _ready: Ready) -> Response {
+        unimplemented!();
+    }
+    fn timeout<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S, _id: TimeoutId) -> Response {
+        unimplemented!();
+    }
+    fn signal<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S, _signal: Signal) -> Response {
+        unimplemented!();
+    }
+    fn idle<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S) -> Response {
+        unimplemented!();
+    }
+    fn message<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S, _msg: Message) -> Response {
+        unimplemented!();
+    }
+    fn child<S: Scope<CtxOuter, EvOuter>>(&mut self, _scope: &mut S, _pid: pid_t, _exit: ChildExit) -> Response {
+        unimplemented!();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,4 +530,21 @@ mod tests {
         assert_eq!(0, l.event_count());
     }
 
+    struct BrokenEvent;
+
+    impl Event<(), BrokenEvent> for BrokenEvent {
+        fn init<S: Scope<(), BrokenEvent>>(&mut self, _scope: &mut S) -> Response {
+            unreachable!();
+        }
+    }
+
+    /// We can pre-fill the proxy with events and they are not initialized yet.
+    /// But handles are returned.
+    #[test]
+    fn proxy_preinit() {
+        let mut prx: CtxProxy<(), BrokenEvent> = CtxProxy::new(());
+        let h1 = prx.preinsert(BrokenEvent);
+        let h2 = prx.preinsert(BrokenEvent);
+        assert_ne!(h1, h2);
+    }
 }
