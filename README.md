@@ -1,6 +1,7 @@
 # EveBoros ‒ a flexible event loop for Rust
 
-[![Build Status](https://api.travis-ci.org/vorner/eveboros.png?branch=master)](https://travis-ci.org/vorner/eveboros)
+[![Travis Build Status](https://api.travis-ci.org/vorner/eveboros.png?branch=master)](https://travis-ci.org/vorner/eveboros)
+[![AppVeyor Build status](https://ci.appveyor.com/api/projects/status/c3qoud9df1dnwugu/branch/master?svg=true)](https://ci.appveyor.com/project/vorner/eveboros/branch/master)
 
 Unlike [rotor](https://crates.io/crates/rotor) and
 [Tokio](https://github.com/tokio-rs/tokio), EveBoros doesn't try to force you
