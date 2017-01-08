@@ -370,7 +370,7 @@ impl<'a, Context, ScopeEv> ScopeObjSafe<Context, ScopeEv> for DynScope<'a, Conte
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::*;
+    use ::{Loop, LoopIfaceObjSafe, LoopIface, Scope, Response, TimeoutId, Event};
     use std::time::Duration;
 
     struct IdleEvent;
