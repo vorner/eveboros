@@ -1,0 +1,24 @@
+language: rust
+cache: cargo
+rust:
+    - stable
+    - beta
+    - nightly
+os:
+    # For now.. We'll support more later
+    - linux
+before_script: (cargo install rustfmt || true)
+script:
+    - |
+      export PATH=$PATH:~/.cargo/bin &&
+      cargo fmt &&
+      cargo doc --no-deps &&
+      cargo build --verbose &&
+      cargo test --verbose
+branches:
+    # Builds for all the branches, please
+    - /.*/
+
+matrix:
+    allow_failures:
+        - rust: nightly

@@ -166,4 +166,3 @@ pub struct Handle {
     id: usize,
     generation: u64,
 }
-
