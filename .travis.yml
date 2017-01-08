@@ -11,10 +11,10 @@ before_script: (cargo install rustfmt || true)
 script:
     - |
       export PATH=$PATH:~/.cargo/bin &&
-      cargo fmt &&
-      cargo doc --no-deps &&
       cargo build --verbose &&
-      cargo test --verbose
+      cargo test --verbose &&
+      cargo doc --no-deps &&
+      cargo fmt
 
 matrix:
     allow_failures:
