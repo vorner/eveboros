@@ -18,9 +18,11 @@ use mio::channel::{SyncSender, TrySendError};
 use nix::c_int;
 use nix::sys::signal::{Signal, NSIG, SigAction, SigHandler, SigSet, SigFlags, SIG_SETMASK, SA_NOCLDSTOP, sigaction};
 
+pub type Flags = Arc<[AtomicBool; NSIG as usize]>;
+
 pub struct SignalNotifier {
     pub sender: SyncSender<()>,
-    pub flags: Arc<[AtomicBool; NSIG as usize]>,
+    pub flags: Flags,
 }
 
 type SigNotifiers = [Vec<SignalNotifier>; NSIG as usize];
@@ -102,4 +104,65 @@ pub fn register(signal: Signal, notifier: SignalNotifier) {
     }
     // Return the old signal mask
     old_mask.thread_set_mask().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread::spawn;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::sync_channel as chan;
+    use std::sync::mpsc::TryRecvError;
+
+    use nix::sys::signal::{Signal, raise};
+    use mio::channel::sync_channel;
+
+    use super::*;
+
+    /// Start bunch of threads, each one registering for SIGUSR1 and wait for them.
+    #[test]
+    fn dispatch() {
+        // Run this one multiple times, as there may be some race conditions
+        for _ in 0..100 {
+            // We need to know when the threads already registered
+            let (s, r) = chan(1);
+            let threads: Vec<_> = (0..10)
+                .map(|_| {
+                    let s = s.clone();
+                    spawn(move || {
+                        let flags: Flags = <Flags>::default();
+                        let (sender, receiver) = sync_channel(1);
+                        register(Signal::SIGUSR1,
+                                 SignalNotifier {
+                                     sender: sender,
+                                     flags: flags.clone(),
+                                 });
+                        // We registered, tell the main thread we are ready to get the signal
+                        s.send(());
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(_) => break,
+                                Err(TryRecvError::Disconnected) => panic!(),
+                                // We don't have blocking recv here, so we just loop here for a while
+                                Err(TryRecvError::Empty) => (),
+                            }
+                        }
+                        // Check the values
+                        for (i, val) in flags.iter().enumerate() {
+                            assert_eq!(i == Signal::SIGUSR1 as usize, val.load(Ordering::SeqCst));
+                        }
+                    })
+                })
+                .collect();
+            // Wait for the threads to be ready
+            for &_ in threads.iter() {
+                r.recv();
+            }
+            // Send the signal
+            raise(Signal::SIGUSR1).unwrap();
+            // Wait for the threads and check they are happy
+            for t in threads {
+                t.join().unwrap();
+            }
+        }
+    }
 }
