@@ -2,6 +2,8 @@ extern crate eveboros;
 extern crate nix;
 extern crate libc;
 
+// XXX
+
 /**
  * Tests for the signal and child handling. The thread handling in the normal harness interferes
  * with what we need (we actually need to mask the signals in all threads and we have no way to do
@@ -23,7 +25,8 @@ struct SigRecipient(Signal);
 
 impl Event<(), SigRecipient> for SigRecipient {
     fn init<S: Scope<(), SigRecipient>>(&mut self, scope: &mut S) -> Response {
-        scope.signal(self.0).map(|_| true)
+        scope.signal(self.0);
+        Ok(true)
     }
     fn signal<S: Scope<(), SigRecipient>>(&mut self, _scope: &mut S, signal: Signal) -> Response {
         assert_eq!(self.0, signal);
@@ -57,7 +60,7 @@ struct ChildWatcher(pid_t);
 
 impl<E: From<ChildWatcher>> Event<(), E> for ChildWatcher {
     fn init<S: Scope<(), E>>(&mut self, scope: &mut S) -> Response {
-        scope.child(self.0)?;
+        scope.child(self.0);
         Ok(true)
     }
     fn child<S: Scope<(), E>>(&mut self, _scope: &mut S, pid: pid_t, exit: ChildExit) -> Response {
@@ -77,7 +80,7 @@ fn fork_child() -> pid_t {
 
 fn child_test() {
     let mut l: Loop<(), ChildWatcher> = Loop::new(()).unwrap();
-    l.signal_enable(Signal::SIGCHLD).unwrap();
+    l.signal_enable(Signal::SIGCHLD);
     let pid = fork_child();
     let handle = l.insert(ChildWatcher(pid)).unwrap();
     l.run_until_complete(handle).unwrap();
@@ -86,7 +89,7 @@ fn child_test() {
 /// Test we can't register the same PID twice
 fn child_multiple_test() {
     let mut l: Loop<(), ChildWatcher> = Loop::new(()).unwrap();
-    l.signal_enable(Signal::SIGCHLD).unwrap();
+    l.signal_enable(Signal::SIGCHLD);
     let pid = fork_child();
     l.insert(ChildWatcher(pid)).unwrap();
     l.insert(ChildWatcher(pid)).unwrap();

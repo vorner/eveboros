@@ -144,9 +144,9 @@ struct Shutdown;
 impl<Ev> Event<(), Ev> for Shutdown {
     fn init<S: Scope<(), Ev>>(&mut self, scope: &mut S) -> Response {
         // Register some signals when we would like to shut down
-        scope.signal(Signal::SIGINT)?;
-        scope.signal(Signal::SIGQUIT)?;
-        scope.signal(Signal::SIGTERM)?;
+        scope.signal(Signal::SIGINT);
+        scope.signal(Signal::SIGQUIT);
+        scope.signal(Signal::SIGTERM);
         Ok(true)
     }
     fn signal<S: Scope<(), Ev>>(&mut self, scope: &mut S, _signal: Signal) -> Response {

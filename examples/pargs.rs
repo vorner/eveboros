@@ -38,7 +38,7 @@ impl Runner {
             Some(Ok(cmd)) => {
                 // We have a process to start, do so and register it
                 let child = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn()?;
-                scope.child(child.id() as pid_t)?;
+                scope.child(child.id() as pid_t);
                 self.0 = Some(cmd);
                 Ok(true)
             },

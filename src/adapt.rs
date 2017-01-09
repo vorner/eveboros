@@ -338,7 +338,7 @@ impl<'a, Context, ScopeEv> ScopeObjSafe<Context, ScopeEv> for DynScope<'a, Conte
     fn timeout_at(&mut self, when: Instant) -> TimeoutId {
         self.0.timeout_at(when)
     }
-    fn signal(&mut self, signal: Signal) -> Result<()> {
+    fn signal(&mut self, signal: Signal) {
         self.0.signal(signal)
     }
     fn idle(&mut self) {
@@ -362,7 +362,7 @@ impl<'a, Context, ScopeEv> ScopeObjSafe<Context, ScopeEv> for DynScope<'a, Conte
     fn background_submit(&mut self, task: Box<TaskWrapper>) -> Result<BackgroundId> {
         self.0.background_submit(task)
     }
-    fn child(&mut self, pid: pid_t) -> Result<()> {
+    fn child(&mut self, pid: pid_t) {
         self.0.child(pid)
     }
 }

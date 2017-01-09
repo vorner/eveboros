@@ -10,33 +10,32 @@
 use std::sync::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashMap;
-use std::iter::repeat;
 use std::mem::swap;
 
 use mio::channel::{SyncSender, TrySendError};
 use nix::c_int;
-use nix::sys::signal::{Signal, NSIG, SigAction, SigHandler, SigSet, SigFlags, SIG_SETMASK, SA_NOCLDSTOP, sigaction};
+use nix::sys::signal::{Signal, NSIG, SigAction, SigHandler, SigSet, SIG_SETMASK, SA_NOCLDSTOP, SA_RESTART, sigaction};
 
-pub type Flags = Arc<[AtomicBool; NSIG as usize]>;
+const SIG_COUNT: usize = NSIG as usize;
 
+pub type Flags = Arc<[AtomicBool; SIG_COUNT]>;
+
+#[derive(Clone)]
 pub struct SignalNotifier {
     pub sender: SyncSender<()>,
     pub flags: Flags,
 }
 
-type SigNotifiers = [Vec<SignalNotifier>; NSIG as usize];
-
 struct SignalDispatch {
-    registered: SigNotifiers,
-    setup: [bool; NSIG as usize],
+    registered: [Vec<SignalNotifier>; SIG_COUNT],
+    setup: [bool; SIG_COUNT],
 }
 
 impl SignalDispatch {
     fn new() -> Self {
         SignalDispatch {
-            registered: <SigNotifiers>::default(),
-            setup: [false; NSIG as usize],
+            registered: Default::default(),
+            setup: [false; SIG_COUNT],
         }
     }
     fn register(&mut self, signal: Signal, notifier: SignalNotifier) {
@@ -44,7 +43,7 @@ impl SignalDispatch {
         assert!(sig_raw < NSIG);
         let snum = sig_raw as usize;
         if !self.setup[snum] {
-            let action = SigAction::new(SigHandler::Handler(handler), SA_NOCLDSTOP, SigSet::empty());
+            let action = SigAction::new(SigHandler::Handler(handler), SA_NOCLDSTOP | SA_RESTART, SigSet::empty());
             unsafe { sigaction(signal, &action).unwrap() };
             self.setup[snum] = true;
         }
@@ -129,7 +128,7 @@ mod tests {
                 .map(|_| {
                     let s = s.clone();
                     spawn(move || {
-                        let flags: Flags = <Flags>::default();
+                        let flags: Flags = Default::default();
                         let (sender, receiver) = sync_channel(1);
                         register(Signal::SIGUSR1,
                                  SignalNotifier {
@@ -137,7 +136,8 @@ mod tests {
                                      flags: flags.clone(),
                                  });
                         // We registered, tell the main thread we are ready to get the signal
-                        s.send(());
+                        // (ignore the result, we don't care in tests)
+                        let _ = s.send(());
                         loop {
                             match receiver.try_recv() {
                                 Ok(_) => break,
@@ -155,7 +155,7 @@ mod tests {
                 .collect();
             // Wait for the threads to be ready
             for &_ in threads.iter() {
-                r.recv();
+                let _ = r.recv();
             }
             // Send the signal
             raise(Signal::SIGUSR1).unwrap();
