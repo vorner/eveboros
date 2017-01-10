@@ -2,15 +2,10 @@ extern crate eveboros;
 extern crate nix;
 extern crate libc;
 
-// XXX
-
 /**
- * Tests for the signal and child handling. The thread handling in the normal harness interferes
- * with what we need (we actually need to mask the signals in all threads and we have no way to do
- * it in the main harness thread).
- *
- * This actually runs without any harness. In case of a problem, this whole thing simply crashes
- * (without running the rest of the tests). But that's enough for this.
+ * Tests for the signal and child handling. It doesn't really need to be an integration test, it's
+ * one for here because of historical reasons. But testing something from outside doesn't hurt
+ * either.
  */
 
 use eveboros::{Loop, Event, Scope, Response, ChildExit, LoopIface, LoopIfaceObjSafe};
@@ -18,7 +13,6 @@ use nix::sys::signal::{raise, Signal};
 use nix::unistd::{ForkResult, fork};
 use libc::pid_t;
 use std::process::exit;
-use std::panic::{catch_unwind, set_hook, take_hook};
 
 /// Thing that terminates once the correct signal is received
 struct SigRecipient(Signal);
@@ -35,6 +29,7 @@ impl Event<(), SigRecipient> for SigRecipient {
 }
 
 /// Test signal delivery to events
+#[test]
 fn signal_test() {
     let mut l: Loop<(), SigRecipient> = Loop::new(()).unwrap();
     // Push bunch of signal recipients in
@@ -78,6 +73,7 @@ fn fork_child() -> pid_t {
     }
 }
 
+#[test]
 fn child_test() {
     let mut l: Loop<(), ChildWatcher> = Loop::new(()).unwrap();
     l.signal_enable(Signal::SIGCHLD);
@@ -87,22 +83,12 @@ fn child_test() {
 }
 
 /// Test we can't register the same PID twice
+#[test]
+#[should_panic]
 fn child_multiple_test() {
     let mut l: Loop<(), ChildWatcher> = Loop::new(()).unwrap();
     l.signal_enable(Signal::SIGCHLD);
     let pid = fork_child();
     l.insert(ChildWatcher(pid)).unwrap();
     l.insert(ChildWatcher(pid)).unwrap();
-}
-fn main() {
-    signal_test();
-    child_test();
-    set_hook(Box::new(|_| ())); // Don't print the info about the panic we want to happen
-    match catch_unwind(child_multiple_test) {
-        Ok(_) => {
-            take_hook(); // Allow normal panicking again.
-            panic!("Unexpectedly didn't panic on multiple registration of the same PID");
-        },
-        Err(_) => (),
-    }
 }

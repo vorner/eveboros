@@ -9,14 +9,6 @@ path = "src/lib.rs"
 harness = true
 test = true
 
-[[test]]
-name = "signal-handling"
-path = "tests/signal-handling.rs"
-# We need this thing to run without any test harness, because it interferes
-# with our signal handling
-harness = false
-test = true
-
 [dependencies]
 mio = "0.6"
 linked-hash-map = "0.3"
