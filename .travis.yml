@@ -19,5 +19,3 @@ script:
 matrix:
     allow_failures:
         - rust: nightly
-        # We use the signal fd now, which will probably change soon, but it fails now
-        - os: osx

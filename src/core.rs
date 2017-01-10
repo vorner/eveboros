@@ -10,17 +10,16 @@ use std::mem::replace;
 use std::convert::From;
 use std::any::TypeId;
 use std::sync::mpsc::TryRecvError;
-use std::os::unix::io::AsRawFd;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::io::ErrorKind;
 
 use mio::{Poll, Events, Token, Ready, Evented, PollOpt};
-use mio::channel::{Receiver, Sender, channel, SendError};
-use mio::unix::EventedFd;
+use mio::channel::{Receiver, Sender, channel, sync_channel, SendError};
 use linked_hash_map::LinkedHashMap;
 use threadpool::ThreadPool;
-use nix::sys::signal::{SigSet, Signal};
-use nix::sys::signalfd::{SignalFd, SFD_CLOEXEC, SFD_NONBLOCK};
+use nix::sys::signal::{Signal, NSIG};
 use nix::sys::wait::{WaitStatus, waitpid, WNOHANG};
-use nix::Errno;
+use nix::{Errno, c_int};
 use nix;
 use libc::pid_t;
 
@@ -28,6 +27,10 @@ use super::{IoId, TimeoutId, Handle};
 use recycler::Recycler;
 use error::{Result, Error};
 use stolen_cell::StolenCell;
+use signal_dispatch::SignalNotifier;
+use signal_dispatch::register as sig_register;
+
+const SIG_COUNT: usize = NSIG as usize;
 
 /// A thread-safe channel to notify events.
 ///
@@ -455,8 +458,9 @@ pub trait ScopeObjSafe<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     }
     /// Show interest in receiving these types of signals.
     ///
-    /// This also automatically enables the loop's handling of this signal.
-    fn signal(&mut self, signal: Signal) -> Result<()>;
+    /// This also automatically enables the loop's handling of this signal. See
+    /// [signal_enable](struct.Event.html#method.signal_enable) for details about signals.
+    fn signal(&mut self, signal: Signal);
     /// Run code when the loop is idle.
     ///
     /// Run the [idle](trait.Event.html#tymethod.idle) callback once the event loop has nothing
@@ -500,7 +504,7 @@ pub trait ScopeObjSafe<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     ///
     /// It panics if you try to register the same `pid` multiple times (by either the same or
     /// different events) into the same loop.
-    fn child(&mut self, pid: pid_t) -> Result<()>;
+    fn child(&mut self, pid: pid_t);
 }
 
 /// Necessary information passed to every callback.
@@ -685,7 +689,7 @@ pub enum DeliveryMode {
 pub enum ChildExit {
     /// A normal exit, with the given exit code
     Exited(i8),
-    /// Dead caused by a signal
+    /// Death caused by a signal
     Signaled(Signal),
 }
 
@@ -902,8 +906,7 @@ impl<FinalR: Send + 'static> Drop for BackgroundWrapper<FinalR> {
 /// dispatches the events. The events can terminate and create more events.
 ///
 /// It is possible to have an active loop in more than one thread (distinct instance in each
-/// thread). However, each unix signal can be handled by only one thread (and therefore event loop).
-/// As a result, only one event loop may handle child processes.
+/// thread).
 pub struct Loop<Context, Ev> {
     poll: Poll,
     mio_events: Events,
@@ -942,9 +945,10 @@ pub struct Loop<Context, Ev> {
     threadpool: Option<ThreadPool>,
     background_generation: Wrapping<u64>,
     // Signal handling
-    signal_mask: SigSet,
-    signal_fd: SignalFd,
-    signal_recipients: HashMap<i32, HashSet<Handle>>,
+    signal_recipients: [HashSet<Handle>; SIG_COUNT],
+    signals_enabled: [bool; SIG_COUNT],
+    signal_notifier: SignalNotifier,
+    signal_receiver: Receiver<()>,
     // Child tracking
     children: HashMap<pid_t, Handle>,
 }
@@ -957,9 +961,8 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         let (sender, receiver) = channel();
         let poll = Poll::new()?;
         poll.register(&receiver, CHANNEL_TOK, Ready::readable(), PollOpt::empty())?;
-        let signal_mask = SigSet::empty();
-        let signal_fd = SignalFd::with_flags(&signal_mask, SFD_CLOEXEC | SFD_NONBLOCK)?;
-        poll.register(&EventedFd(&signal_fd.as_raw_fd()), SIGNAL_TOK, Ready::readable(), PollOpt::empty())?;
+        let (sig_sender, sig_receiver) = sync_channel(1);
+        poll.register(&sig_receiver, SIGNAL_TOK, Ready::readable(), PollOpt::empty())?;
         Ok(Loop {
             poll: poll,
             mio_events: Events::with_capacity(1024),
@@ -982,9 +985,13 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             receiver: receiver,
             threadpool: None,
             background_generation: Wrapping(0),
-            signal_mask: signal_mask,
-            signal_fd: signal_fd,
-            signal_recipients: HashMap::new(),
+            signal_recipients: Default::default(),
+            signals_enabled: Default::default(),
+            signal_notifier: SignalNotifier {
+                sender: sig_sender,
+                flags: Default::default(),
+            },
+            signal_receiver: sig_receiver,
             children: HashMap::new(),
         })
     }
@@ -1015,8 +1022,7 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
         self.want_idle.remove(&handle);
         // There are only few signals, go through them all instead of building some fancy
         // back-linking
-        //
-        for sig_recpt in self.signal_recipients.values_mut() {
+        for sig_recpt in self.signal_recipients.iter_mut() {
             sig_recpt.remove(&handle);
         }
         for child in event.children.into_iter() {
@@ -1173,28 +1179,24 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
                     }
                 },
                 SIGNAL_TOK => {
-                    loop {
-                        match self.signal_fd.read_signal() {
-                            Ok(None) => break, // No more signals for now, return later
-                            Ok(Some(siginfo)) => {
-                                // Convert there and back ‒ it is not really guaranteed the
-                                // from_c_int doesn't do any fancy conversion.
-                                //
-                                let signal = Signal::from_c_int(siginfo.ssi_signo as i32)?;
-                                let signum = signal as i32;
-                                if signal == Signal::SIGCHLD {
-                                    Self::children_gather(&mut self.scheduled, &mut self.children, &mut self.events)?;
+                    // Make room in the wakeup channel for next wakeup. We don't care about the
+                    // result. We need to clear it before clearing the signals (otherwise we could
+                    // have a race condition and not notice a signal)
+                    let _ = self.signal_receiver.try_recv();
+                    // Go through all the signals and see if they are set (and set them to false)
+                    for (signum, pending) in self.signal_notifier.flags.iter().enumerate() {
+                        if pending.swap(false, AtomicOrdering::SeqCst) {
+                            let signal = Signal::from_c_int(signum as c_int)?;
+                            if signal == Signal::SIGCHLD {
+                                Self::children_gather(&mut self.scheduled, &mut self.children, &mut self.events)?;
+                            }
+                            // Send an event to each recipient of this signal
+                            self.scheduled.extend(self.signal_recipients[signum].iter().map(|handle| {
+                                Task {
+                                    recipient: *handle,
+                                    param: TaskParam::Signal(signal),
                                 }
-                                if let Some(ref recipients) = self.signal_recipients.get(&signum) {
-                                    self.scheduled.extend(recipients.iter().map(|handle| {
-                                        Task {
-                                            recipient: handle.clone(),
-                                            param: TaskParam::Signal(signal),
-                                        }
-                                    }));
-                                }
-                            },
-                            Err(e) => return Err(Error::Nix(e)),
+                            }));
                         }
                     }
                 },
@@ -1262,7 +1264,16 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
             return Err(Error::Empty);
         }
         let wakeup = self.timeout_min();
-        self.poll.poll(&mut self.mio_events, wakeup)?;
+        if let Err(err) = self.poll.poll(&mut self.mio_events, wakeup) {
+            if err.kind() == ErrorKind::Interrupted {
+                // In the EINTR case, we want to try again. We short-circuit this function and get
+                // called again.
+                return Ok(());
+            } else {
+                // But we propagate other errors
+                return Err(Error::Io(err));
+            }
+        }
         // We slept a while, update the now cache
         self.now = Instant::now();
 
@@ -1341,16 +1352,15 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     }
     /// Let the loop handle the given signal (in addition to any others it already handles).
     ///
-    /// This will let the event loop take care of the given signal. The signal is masked from the
-    /// normal signal handlers in this thread and it is registered within the loop. It can then be
-    /// handled by events registering for the signal.
+    /// This will let the event loop take care of the given signal. If there was a signal handler
+    /// before, it is reset.
     ///
     /// If more than one event registers for the signal, it is broadcasted between them. Similarly,
     /// if no event wants it, the signal is lost.
     ///
-    /// Calling this when the signal is already enabled in this event loop is a no-op. Enabling it
-    /// in multiple loops for process-level signals may have undesirable effects (the first one to
-    /// ask for it gets the signal).
+    /// Calling this when the signal is already enabled in this event loop is a no-op.
+    ///
+    /// It is possible to register the same signal in multiple loops, even from multiple threads.
     ///
     /// The first event that asks for the signal automatically triggers enabling of the signal.
     ///
@@ -1359,50 +1369,20 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     /// Signals get merged when multiple same ones arrive before they get handled. Therefore,
     /// receiving the signal means that *at least one* was sent, but there may have been more.
     ///
-    /// For the signal handling to work, the given signal must be masked in all threads for
-    /// process-level signals (most of the useful ones are process-level ones). As the mask is
-    /// inherited from creating thread, creating the loop first before starting any threads and
-    /// calling this or registering events that use signals is one way to accomplish that. Note that
-    /// this also includes the background threads in the loop's thread-pool, which are created once
-    /// you either set the number of threads or the first background job is submitted.
-    ///
-    /// SIGCHLD is handled specially by the loop. But you can enable it this way for the above
+    /// SIGCHLD is handled specially by the loop. But you can enable it manually before starting
+    /// the first child, so the signal is not lost.
     /// reasons.
     ///
-    /// The original mask is *not* restored on the loop destruction.
-    pub fn signal_enable(&mut self, signal: Signal) -> Result<()> {
-        if self.signal_mask.contains(signal) {
-            // Already registered, do nothing
-            return Ok(());
+    /// The original signal handler is *not* restored on the loop destruction.
+    pub fn signal_enable(&mut self, signal: Signal) {
+        let signum = signal as usize;
+        assert!(signum < SIG_COUNT);
+        if self.signals_enabled[signum] {
+            // Already registered
+            return;
         }
-        self.signal_mask.add(signal);
-        self.signal_mask.thread_block()?;
-        self.signal_fd.set_mask(&self.signal_mask)?;
-        Ok(())
-    }
-    /// Disable receiving of the given signal and unmask it from this process.
-    ///
-    /// This does not unregister the events that registered for the signal. They just don't get the
-    /// signal notification any more.
-    ///
-    /// # Notes
-    ///
-    /// Note that any event may register for the signal later on, which would re-enable the signal
-    /// handling.
-    ///
-    /// Other threads may not get the signals re-enabled automatically (but newly started threads
-    /// inherit the current mask).
-    pub fn signal_disable(&mut self, signal: Signal) -> Result<()> {
-        if !self.signal_mask.contains(signal) {
-            // Not there, nothing to disable
-            return Ok(());
-        }
-        self.signal_mask.remove(signal);
-        self.signal_fd.set_mask(&self.signal_mask)?;
-        let mut unmask = SigSet::empty();
-        unmask.add(signal);
-        unmask.thread_unblock()?;
-        Ok(())
+        sig_register(signal, self.signal_notifier.clone());
+        self.signals_enabled[signum] = true;
     }
 }
 
@@ -1582,11 +1562,10 @@ impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScop
     fn idle(&mut self) {
         self.event_loop.want_idle.insert(self.handle, ());
     }
-    fn signal(&mut self, signal: Signal) -> Result<()> {
-        self.event_loop.signal_enable(signal)?;
-        let signum = signal as i32;
-        self.event_loop.signal_recipients.entry(signum).or_insert(HashSet::new()).insert(self.handle);
-        Ok(())
+    fn signal(&mut self, signal: Signal) {
+        self.event_loop.signal_enable(signal);
+        let signum = signal as usize;
+        self.event_loop.signal_recipients[signum].insert(self.handle);
     }
     fn expect_message(&mut self, tp: TypeId) {
         self.event_loop.events[self.handle.id].expected_messages.insert(tp);
@@ -1640,12 +1619,11 @@ impl<'a, Context, Ev: Event<Context, Ev>> ScopeObjSafe<Context, Ev> for LoopScop
         });
         Ok(id)
     }
-    fn child(&mut self, pid: pid_t) -> Result<()> {
-        self.event_loop.signal_enable(Signal::SIGCHLD)?;
+    fn child(&mut self, pid: pid_t) {
+        self.event_loop.signal_enable(Signal::SIGCHLD);
         assert!(!self.event_loop.children.contains_key(&pid));
         self.event_loop.children.insert(pid, self.handle);
         self.event_loop.events[self.handle.id].children.insert(pid);
-        Ok(())
     }
 }
 
