@@ -458,7 +458,8 @@ pub trait ScopeObjSafe<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     }
     /// Show interest in receiving these types of signals.
     ///
-    /// This also automatically enables the loop's handling of this signal.
+    /// This also automatically enables the loop's handling of this signal. See
+    /// [signal_enable](struct.Event.html#method.signal_enable) for details about signals.
     fn signal(&mut self, signal: Signal);
     /// Run code when the loop is idle.
     ///
@@ -503,7 +504,6 @@ pub trait ScopeObjSafe<Context, Ev>: LoopIfaceObjSafe<Context, Ev> {
     ///
     /// It panics if you try to register the same `pid` multiple times (by either the same or
     /// different events) into the same loop.
-    /// XXX
     fn child(&mut self, pid: pid_t);
 }
 
@@ -904,9 +904,7 @@ impl<FinalR: Send + 'static> Drop for BackgroundWrapper<FinalR> {
 /// dispatches the events. The events can terminate and create more events.
 ///
 /// It is possible to have an active loop in more than one thread (distinct instance in each
-/// thread). However, each unix signal can be handled by only one thread (and therefore event loop).
-/// As a result, only one event loop may handle child processes.
-/// XXX
+/// thread).
 pub struct Loop<Context, Ev> {
     poll: Poll,
     mio_events: Events,
@@ -1352,16 +1350,15 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     }
     /// Let the loop handle the given signal (in addition to any others it already handles).
     ///
-    /// This will let the event loop take care of the given signal. The signal is masked from the
-    /// normal signal handlers in this thread and it is registered within the loop. It can then be
-    /// handled by events registering for the signal.
+    /// This will let the event loop take care of the given signal. If there was a signal handler
+    /// before, it is reset.
     ///
     /// If more than one event registers for the signal, it is broadcasted between them. Similarly,
     /// if no event wants it, the signal is lost.
     ///
-    /// Calling this when the signal is already enabled in this event loop is a no-op. Enabling it
-    /// in multiple loops for process-level signals may have undesirable effects (the first one to
-    /// ask for it gets the signal).
+    /// Calling this when the signal is already enabled in this event loop is a no-op.
+    ///
+    /// It is possible to register the same signal in multiple loops, even from multiple threads.
     ///
     /// The first event that asks for the signal automatically triggers enabling of the signal.
     ///
@@ -1370,18 +1367,11 @@ impl<Context, Ev: Event<Context, Ev>> Loop<Context, Ev> {
     /// Signals get merged when multiple same ones arrive before they get handled. Therefore,
     /// receiving the signal means that *at least one* was sent, but there may have been more.
     ///
-    /// For the signal handling to work, the given signal must be masked in all threads for
-    /// process-level signals (most of the useful ones are process-level ones). As the mask is
-    /// inherited from creating thread, creating the loop first before starting any threads and
-    /// calling this or registering events that use signals is one way to accomplish that. Note that
-    /// this also includes the background threads in the loop's thread-pool, which are created once
-    /// you either set the number of threads or the first background job is submitted.
-    ///
-    /// SIGCHLD is handled specially by the loop. But you can enable it this way for the above
+    /// SIGCHLD is handled specially by the loop. But you can enable it manually before starting
+    /// the first child, so the signal is not lost.
     /// reasons.
     ///
-    /// The original mask is *not* restored on the loop destruction.
-    /// XXX
+    /// The original signal handler is *not* restored on the loop destruction.
     pub fn signal_enable(&mut self, signal: Signal) {
         let signum = signal as usize;
         assert!(signum < SIG_COUNT);

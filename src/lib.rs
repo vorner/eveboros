@@ -56,7 +56,7 @@
 //!
 //! # Interface
 //!
-//! There's one central object, [Loop](struct.Event.html). You register for events, each time
+//! There's one central object, [Loop](struct.Loop.html). You register for events, each time
 //! providing an [Event](trait.Event.html) object. The event registers interest for some things and
 //! gets its callbacks executed when the thing happens.
 //!
@@ -131,7 +131,6 @@
 //! }
 //!
 //! ```
-//!
 
 extern crate mio;
 extern crate linked_hash_map;
