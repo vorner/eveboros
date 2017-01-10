@@ -131,7 +131,11 @@
 //! }
 //!
 //! ```
-//!
+
+#![deny(unused_unsafe,unused_parens,unused_must_use,safe_extern_statics,private_no_mangle_statics,
+    private_no_mangle_fns,private_in_public,overflowing_literals,no_mangle_generic_items,
+    extra_requirement_in_impl)]
+#![warn(unused_qualifications,unused_import_braces,unused_extern_crates,missing_docs)]
 
 extern crate mio;
 extern crate linked_hash_map;

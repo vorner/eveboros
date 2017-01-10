@@ -827,6 +827,7 @@ struct IoHolder<E: Evented> {
 }
 
 /// This is public only formally O:-)
+#[allow(missing_docs)]
 pub trait IoHolderAny: Any {
     fn io(&self) -> &Evented;
     fn recipient(&self) -> Handle;
@@ -849,8 +850,9 @@ const TOKEN_SHIFT: usize = 2;
 const CHANNEL_TOK: Token = Token(0);
 const SIGNAL_TOK: Token = Token(1);
 
-// Similar to FnOnce(), but one that can actually be passed where we want
+/// Similar to FnOnce(), but one that can actually be passed where we want
 pub trait TaskWrapper: Send + 'static {
+    /// Call the task
     fn call(&mut self, id: BackgroundId, sender: Sender<RemoteMessage>);
 }
 
